@@ -1,6 +1,4 @@
 cmake_minimum_required(VERSION 3.20)
-set(CMAKE_C_COMPILER clang)
-set(CMAKE_CXX_COMPILER clang++)
 project(iUserApps C CXX ASM)
 
 set(CMAKE_CXX_STANDARD 23)
