@@ -1,0 +1,3 @@
+[submodule "outside/ilibcxx"]
+	path = outside/ilibcxx
+	url = https://github.com/ZincPlatforms/ilibcxx
