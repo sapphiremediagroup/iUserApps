@@ -35,13 +35,26 @@ constexpr std::uint32_t kColorAccent = 0x00e39d3fU;
 constexpr std::uint32_t kColorAccentSoft = 0x004d86b8U;
 constexpr std::uint32_t kColorTileA = 0x00344f71U;
 constexpr std::uint32_t kColorTileB = 0x00273c59U;
+constexpr int kTaskbarY = static_cast<int>(kSurfaceHeight) - 58;
+constexpr int kTaskbarButtonSize = 48;
+constexpr int kTaskbarButtonGap = 72;
+constexpr int kLauncherMaxEntries = 12;
+
+struct LauncherEntry {
+    char name[64];
+    char path[96];
+};
 
 struct DesktopState {
     std::uint32_t* wallpaper;
     bool wallpaperReady;
     bool focused;
+    bool launcherOpen;
+    bool terminalStarted;
     std::uint32_t activitySeed;
     char currentBackground[192];
+    LauncherEntry launcherEntries[kLauncherMaxEntries];
+    std::uint32_t launcherEntryCount;
 };
 
 void write_str(const char* s) {
@@ -61,11 +74,23 @@ std::Handle connect_service(const char* name) {
 }
 
 bool launch_file_browser() {
-    return std::spawn("/bin/file-browser.exe") != fail;
+    return std::spawn("/bin/file-browser") != fail;
 }
 
 bool launch_background_switcher() {
-    return std::spawn("/bin/background-switcher.exe") != fail;
+    return std::spawn("/bin/background-switcher") != fail;
+}
+
+bool launch_terminal() {
+    return std::spawn("/bin/terminal") != fail;
+}
+
+bool launch_cube() {
+    return std::spawn("/bin/cube") != fail;
+}
+
+bool launch_path(const char* path) {
+    return path && path[0] != '\0' && std::spawn(path) != fail;
 }
 
 std::uint8_t color_r(std::uint32_t color) {
@@ -145,6 +170,55 @@ void fill_rect(
         for (int drawX = startX; drawX < endX; ++drawX) {
             pixels[drawY * surfaceWidth + drawX] = color;
         }
+    }
+}
+
+std::uint8_t glyph_rows(char c, int row) {
+    if (c >= 'a' && c <= 'z') c = static_cast<char>(c - 'a' + 'A');
+    static constexpr std::uint8_t digits[10][7] = {
+        {14, 17, 19, 21, 25, 17, 14}, {4, 12, 4, 4, 4, 4, 14},
+        {14, 17, 1, 2, 4, 8, 31}, {30, 1, 1, 14, 1, 1, 30},
+        {2, 6, 10, 18, 31, 2, 2}, {31, 16, 30, 1, 1, 17, 14},
+        {6, 8, 16, 30, 17, 17, 14}, {31, 1, 2, 4, 8, 8, 8},
+        {14, 17, 17, 14, 17, 17, 14}, {14, 17, 17, 15, 1, 2, 12},
+    };
+    static constexpr std::uint8_t letters[26][7] = {
+        {14,17,17,31,17,17,17}, {30,17,17,30,17,17,30}, {14,17,16,16,16,17,14},
+        {30,17,17,17,17,17,30}, {31,16,16,30,16,16,31}, {31,16,16,30,16,16,16},
+        {14,17,16,23,17,17,15}, {17,17,17,31,17,17,17}, {14,4,4,4,4,4,14},
+        {7,2,2,2,18,18,12}, {17,18,20,24,20,18,17}, {16,16,16,16,16,16,31},
+        {17,27,21,21,17,17,17}, {17,25,21,19,17,17,17}, {14,17,17,17,17,17,14},
+        {30,17,17,30,16,16,16}, {14,17,17,17,21,18,13}, {30,17,17,30,20,18,17},
+        {15,16,16,14,1,1,30}, {31,4,4,4,4,4,4}, {17,17,17,17,17,17,14},
+        {17,17,17,17,17,10,4}, {17,17,17,21,21,21,10}, {17,17,10,4,10,17,17},
+        {17,17,10,4,4,4,4}, {31,1,2,4,8,16,31},
+    };
+
+    if (c >= '0' && c <= '9') return digits[c - '0'][row];
+    if (c >= 'A' && c <= 'Z') return letters[c - 'A'][row];
+    if (c == '-') return row == 3 ? 31 : 0;
+    if (c == '.') return row == 6 ? 4 : 0;
+    if (c == '/') return static_cast<std::uint8_t>(1U << (6 - row));
+    return 0;
+}
+
+void draw_text(std::uint32_t* pixels, int x, int y, const char* text, std::uint32_t color) {
+    if (!pixels || !text) return;
+    int cursor = x;
+    for (std::size_t i = 0; text[i] != '\0'; ++i) {
+        if (text[i] == ' ') {
+            cursor += 6;
+            continue;
+        }
+        for (int row = 0; row < 7; ++row) {
+            const std::uint8_t bits = glyph_rows(text[i], row);
+            for (int col = 0; col < 5; ++col) {
+                if ((bits & (1U << (4 - col))) != 0) {
+                    fill_rect(pixels, kSurfaceWidth, kSurfaceHeight, cursor + col * 2, y + row * 2, 2, 2, color);
+                }
+            }
+        }
+        cursor += 12;
     }
 }
 
@@ -303,6 +377,128 @@ bool load_first_available_background(DesktopState* state) {
     return false;
 }
 
+bool is_launchable_bin_entry(const std::DirEntry& entry) {
+    if (entry.type != std::FileType::Regular || entry.name[0] == '.' || entry.name[0] == '\0') {
+        return false;
+    }
+    return !has_png_suffix(entry.name) && std::strcmp(entry.name, "ld-instantos.so") != 0;
+}
+
+void refresh_launcher_entries(DesktopState* state) {
+    if (!state) return;
+    state->launcherEntryCount = 0;
+
+    std::DirEntry entries[64] = {};
+    const std::uint64_t found = std::readdir("/bin", entries, 64);
+    if (found == fail) {
+        return;
+    }
+
+    for (std::uint64_t index = 0; index < found && state->launcherEntryCount < kLauncherMaxEntries; ++index) {
+        if (!is_launchable_bin_entry(entries[index])) {
+            continue;
+        }
+
+        LauncherEntry& launcher = state->launcherEntries[state->launcherEntryCount++];
+        std::strncpy(launcher.name, entries[index].name, sizeof(launcher.name) - 1);
+        launcher.name[sizeof(launcher.name) - 1] = '\0';
+        std::strncpy(launcher.path, "/bin/", sizeof(launcher.path) - 1);
+        launcher.path[sizeof(launcher.path) - 1] = '\0';
+        append_text(launcher.path, sizeof(launcher.path), entries[index].name);
+    }
+}
+
+void draw_launcher_panel(std::uint32_t* pixels, const DesktopState& state) {
+    if (!state.launcherOpen) {
+        return;
+    }
+
+    fill_rect(pixels, kSurfaceWidth, kSurfaceHeight, 24, 268, 852, 238, 0x00152133U);
+    fill_rect(pixels, kSurfaceWidth, kSurfaceHeight, 24, 268, 852, 4, kColorAccent);
+    draw_text(pixels, 46, 290, "APP LAUNCHER", 0x00f2f2f2U);
+
+    for (std::uint32_t i = 0; i < state.launcherEntryCount; ++i) {
+        const int col = static_cast<int>(i % 3U);
+        const int row = static_cast<int>(i / 3U);
+        const int x = 46 + col * 272;
+        const int y = 324 + row * 42;
+        fill_rect(pixels, kSurfaceWidth, kSurfaceHeight, x, y, 246, 30, (i % 2U) == 0 ? kColorTileA : kColorTileB);
+        draw_text(pixels, x + 12, y + 8, state.launcherEntries[i].name, 0x00ffffffU);
+    }
+}
+
+bool handle_launcher_click(DesktopState* state, int x, int y) {
+    if (!state || !state->launcherOpen) {
+        return false;
+    }
+
+    for (std::uint32_t i = 0; i < state->launcherEntryCount; ++i) {
+        const int col = static_cast<int>(i % 3U);
+        const int row = static_cast<int>(i / 3U);
+        const int entryX = 46 + col * 272;
+        const int entryY = 324 + row * 42;
+        if (x >= entryX && x < entryX + 246 && y >= entryY && y < entryY + 30) {
+            if (!launch_path(state->launcherEntries[i].path)) {
+                write_str("[desktop-shell] FAIL spawn launcher entry\n");
+            }
+            state->launcherOpen = false;
+            state->activitySeed += 61U;
+            return true;
+        }
+    }
+
+    if (x >= 24 && x < 876 && y >= 268 && y < 506) {
+        return true;
+    }
+
+    state->launcherOpen = false;
+    return true;
+}
+
+bool handle_taskbar_click(DesktopState* state, int x, int y) {
+    if (!state || y < kTaskbarY || y >= kTaskbarY + 34) {
+        return false;
+    }
+
+    for (int i = 0; i < 5; ++i) {
+        const int buttonX = 26 + (i * kTaskbarButtonGap);
+        if (x < buttonX || x >= buttonX + kTaskbarButtonSize) {
+            continue;
+        }
+
+        bool ok = true;
+        if (i == 0) ok = launch_terminal();
+        else if (i == 1) ok = launch_file_browser();
+        else if (i == 2) ok = launch_background_switcher();
+        else if (i == 3) ok = launch_cube();
+        else if (i == 4) {
+            state->launcherOpen = !state->launcherOpen;
+            if (state->launcherOpen) {
+                refresh_launcher_entries(state);
+            }
+        }
+
+        if (!ok) {
+            write_str("[desktop-shell] FAIL spawn taskbar app\n");
+        }
+        state->activitySeed += 47U;
+        return true;
+    }
+
+    return false;
+}
+
+bool handle_pointer_press(DesktopState* state, const std::Event& event) {
+    if (!state || event.pointer.action != std::PointerEventAction::Button || event.pointer.buttons == 0) {
+        return false;
+    }
+
+    if (handle_launcher_click(state, event.pointer.x, event.pointer.y)) {
+        return true;
+    }
+    return handle_taskbar_click(state, event.pointer.x, event.pointer.y);
+}
+
 void draw_desktop(std::uint32_t* pixels, const DesktopState& state) {
     if (state.wallpaper && state.wallpaperReady) {
         std::memcpy(pixels, state.wallpaper, sizeof(std::uint32_t) * kSurfaceWidth * kSurfaceHeight);
@@ -325,10 +521,14 @@ void draw_desktop(std::uint32_t* pixels, const DesktopState& state) {
     const int indicatorWidth = 92 + static_cast<int>(state.activitySeed % 220U);
     fill_rect(pixels, kSurfaceWidth, kSurfaceHeight, 54, 460, indicatorWidth, 22, kColorAccent);
 
+    const char* taskbarLabels[5] = {"TERM", "FILES", "BG", "CUBE", "APPS"};
     for (int i = 0; i < 5; ++i) {
-        const int offset = 26 + (i * 72);
-        fill_rect(pixels, kSurfaceWidth, kSurfaceHeight, offset, static_cast<int>(kSurfaceHeight) - 58, 48, 34, kColorTileA);
+        const int offset = 26 + (i * kTaskbarButtonGap);
+        fill_rect(pixels, kSurfaceWidth, kSurfaceHeight, offset, kTaskbarY, kTaskbarButtonSize, 34, i == 4 && state.launcherOpen ? kColorAccent : kColorTileA);
+        draw_text(pixels, offset + 5, kTaskbarY + 11, taskbarLabels[i], 0x00ffffffU);
     }
+
+    draw_launcher_panel(pixels, state);
 
     fill_rect(
         pixels,
@@ -412,7 +612,7 @@ bool handle_shell_request(std::Handle queue, const std::IPCMessage& message, Des
 
 }
 
-int main() {
+int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv) {
     write_str("[desktop-shell] connecting to graphics.compositor\n");
     const std::Handle compositor = connect_service(std::services::graphics_compositor::NAME);
     if (compositor == fail) {
@@ -505,6 +705,12 @@ int main() {
     }
     write_str("[desktop-shell] SUCCESS initial surface_commit\n");
     write_str("[desktop-shell] ready\n");
+    if (!state.terminalStarted) {
+        if (!launch_terminal()) {
+            write_str("[desktop-shell] FAIL autostart terminal\n");
+        }
+        state.terminalStarted = true;
+    }
 
     for (;;) {
         bool redraw = false;
@@ -531,20 +737,43 @@ int main() {
                     std::close(compositor);
                     return 0;
                 }
+            } else if (event.type == std::EventType::Pointer) {
+                if (handle_pointer_press(&state, event)) {
+                    redraw = true;
+                }
             } else if (event.type == std::EventType::Key && event.key.action == std::KeyEventAction::Press) {
                 const bool superPressed = (event.key.modifiers & std::KeyModifierSuper) != 0;
                 const char key = event.key.text[0] != '\0' ? event.key.text[0] : static_cast<char>(event.key.keycode);
-                if (superPressed && (key == 'f' || key == 'F')) {
+                if (superPressed && (key == 't' || key == 'T')) {
+                    if (!launch_terminal()) {
+                        write_str("[desktop-shell] FAIL spawn terminal\n");
+                    }
+                    state.activitySeed += 29U;
+                    redraw = true;
+                } else if (superPressed && (key == 'f' || key == 'F')) {
                     if (!launch_file_browser()) {
-                        write_str("[desktop-shell] FAIL spawn file-browser.exe\n");
+                        write_str("[desktop-shell] FAIL spawn file-browser\n");
                     }
                     state.activitySeed += 31U;
                     redraw = true;
                 } else if (superPressed && (key == 'b' || key == 'B')) {
                     if (!launch_background_switcher()) {
-                        write_str("[desktop-shell] FAIL spawn background-switcher.exe\n");
+                        write_str("[desktop-shell] FAIL spawn background-switcher\n");
                     }
                     state.activitySeed += 37U;
+                    redraw = true;
+                } else if (superPressed && (key == 'c' || key == 'C')) {
+                    if (!launch_cube()) {
+                        write_str("[desktop-shell] FAIL spawn cube\n");
+                    }
+                    state.activitySeed += 41U;
+                    redraw = true;
+                } else if (superPressed && (key == 'a' || key == 'A')) {
+                    state.launcherOpen = !state.launcherOpen;
+                    if (state.launcherOpen) {
+                        refresh_launcher_entries(&state);
+                    }
+                    state.activitySeed += 53U;
                     redraw = true;
                 } else {
                     state.activitySeed += 9U;

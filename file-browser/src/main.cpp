@@ -498,20 +498,22 @@ char ascii_lower(char c) {
     return c;
 }
 
-bool has_exe_suffix(const char* name) {
+bool is_launchable_name(const char* name) {
     if (!name) {
         return false;
     }
 
     const std::size_t length = std::strlen(name);
-    if (length < 4) {
+    if (length == 0) {
         return false;
     }
 
-    return ascii_lower(name[length - 4]) == '.' &&
-           ascii_lower(name[length - 3]) == 'e' &&
-           ascii_lower(name[length - 2]) == 'x' &&
-           ascii_lower(name[length - 1]) == 'e';
+    for (std::size_t i = 0; i < length; ++i) {
+        if (name[i] == '.') {
+            return false;
+        }
+    }
+    return true;
 }
 
 bool path_is_root(const char* path) {
@@ -670,7 +672,7 @@ bool load_directory(BrowserState* state) {
 
         BrowserEntry& entry = state->entries[state->entryCount++];
         entry.dir = gDirScratch[index];
-        entry.executable = entry.dir.type == std::FileType::Regular && has_exe_suffix(entry.dir.name);
+        entry.executable = entry.dir.type == std::FileType::Regular && is_launchable_name(entry.dir.name);
     }
 
     sort_entries(state);
@@ -881,7 +883,7 @@ void initialize_state(BrowserState* state) {
 }
 }
 
-int main() {
+int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv) {
     const std::Handle compositor = connect_service(std::services::graphics_compositor::NAME);
     if (compositor == fail) {
         write_str("[file-browser] FAIL service_connect graphics.compositor\n");

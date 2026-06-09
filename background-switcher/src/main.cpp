@@ -1,86 +1,13 @@
 #include <cstdint.hpp>
 #include <cstring.hpp>
-#include <cmath.hpp>
 #include <fcntl.h>
-#include <math.h>
 #include <new.hpp>
 #include <service_protocol.hpp>
+#include <syscall.hpp>
 #ifdef NULL
 #undef NULL
 #endif
 #define NULL 0
-
-static double stbtt_local_fmod(double value, double modulus) {
-    return std::fmod(value, modulus);
-}
-
-static double stbtt_local_cuberoot(double value) {
-    if (value == 0.0) {
-        return 0.0;
-    }
-
-    const double sign = value < 0.0 ? -1.0 : 1.0;
-    double guess = std::fabs(value);
-    if (guess < 1.0) {
-        guess = 1.0;
-    }
-
-    for (int iteration = 0; iteration < 24; ++iteration) {
-        guess = (2.0 * guess + std::fabs(value) / (guess * guess)) / 3.0;
-    }
-    return sign * guess;
-}
-
-static double stbtt_local_pow(double value, double exponent) {
-    const double oneThird = 1.0 / 3.0;
-    const double diff = exponent - oneThird;
-    if (diff > -0.000001 && diff < 0.000001) {
-        return stbtt_local_cuberoot(value);
-    }
-
-    if (exponent == 0.0) {
-        return 1.0;
-    }
-    if (exponent == 1.0) {
-        return value;
-    }
-
-    const double integer = std::floor(exponent);
-    if (exponent == integer) {
-        const bool negative = integer < 0.0;
-        std::uint64_t count = static_cast<std::uint64_t>(negative ? -integer : integer);
-        double result = 1.0;
-        for (std::uint64_t index = 0; index < count; ++index) {
-            result *= value;
-        }
-        return negative ? (result == 0.0 ? 0.0 : 1.0 / result) : result;
-    }
-
-    return 1.0;
-}
-
-static double stbtt_local_acos(double value) {
-    if (value <= -1.0) {
-        return 3.14159265358979323846;
-    }
-    if (value >= 1.0) {
-        return 0.0;
-    }
-    return static_cast<double>(acosf(static_cast<float>(value)));
-}
-
-#define STBTT_ifloor(x) static_cast<int>(std::floor(x))
-#define STBTT_iceil(x) static_cast<int>(std::ceil(x))
-#define STBTT_sqrt(x) std::sqrt(x)
-#define STBTT_fmod(x, y) stbtt_local_fmod((x), (y))
-#define STBTT_pow(x, y) stbtt_local_pow((x), (y))
-#define STBTT_cos(x) std::cos(x)
-#define STBTT_acos(x) stbtt_local_acos((x))
-#define STBTT_fabs(x) std::fabs(x)
-#define STBTT_STATIC
-#define STB_TRUETYPE_IMPLEMENTATION
-#include <stb_truetype.h>
-#include <syscall.hpp>
 
 namespace {
 constexpr std::uint64_t fail = static_cast<std::uint64_t>(-1);
@@ -88,13 +15,13 @@ constexpr std::uint32_t kSurfaceWidth = 720;
 constexpr std::uint32_t kSurfaceHeight = 460;
 constexpr std::uint32_t kFontPixelHeight = 15;
 constexpr std::uint32_t kFrameIntervalMs = 33;
+constexpr std::uint64_t kApplyCooldownMs = 250;
 constexpr std::uint32_t kMaxEntries = 32;
 constexpr int kPaddingX = 0;
 constexpr int kPaddingY = 16;
 constexpr int kHeaderHeight = 0;
 constexpr int kFooterHeight = 0;
 constexpr int kRowHeight = 34;
-constexpr char kFontPath[] = "/bin/JetBrainsMono-Regular.ttf";
 constexpr char kBackgroundDirectory[] = "/bin/backgrounds";
 constexpr unsigned char kFirstCachedGlyph = 32;
 constexpr unsigned char kLastCachedGlyph = 126;
@@ -122,12 +49,7 @@ struct GlyphBitmap {
 
 struct UIFont {
     bool valid;
-    unsigned char* data;
-    stbtt_fontinfo info;
-    float scale;
-    int ascent;
-    int descent;
-    int lineGap;
+    std::Handle service;
     int cellWidth;
     int lineHeight;
     int baseline;
@@ -146,6 +68,7 @@ struct AppState {
     std::uint32_t scroll;
     bool focused;
     bool running;
+    std::uint64_t lastApplyMs;
     char status[160];
     std::uint32_t statusColor;
 };
@@ -244,104 +167,121 @@ void draw_gradient(std::uint32_t* pixels) {
     }
 }
 
+void destroy_font(UIFont* font);
+
 bool initialize_font(UIFont* font) {
     if (!font) {
         return false;
     }
 
     std::memset(font, 0, sizeof(*font));
-    std::Stat stat = {};
-    if (std::stat(kFontPath, &stat) == fail || stat.st_size == 0) {
+    font->service = connect_service(std::services::font_manager::NAME);
+    if (font->service == fail) {
         return false;
     }
 
-    const std::Handle file = std::open(kFontPath, O_RDONLY);
-    if (file == fail) {
-        return false;
-    }
+    std::services::font_manager::FontInfoRequest infoRequest = {};
+    infoRequest.header.version = std::services::font_manager::VERSION;
+    infoRequest.header.opcode = static_cast<std::uint16_t>(std::services::font_manager::Opcode::GetFontInfo);
+    infoRequest.pixelHeight = kFontPixelHeight;
 
-    const std::size_t fontSize = static_cast<std::size_t>(stat.st_size);
-    font->data = new (std::nothrow) unsigned char[fontSize];
-    if (!font->data) {
-        std::close(file);
-        return false;
-    }
-
-    std::size_t totalRead = 0;
-    while (totalRead < fontSize) {
-        const std::uint64_t bytesRead = std::read(file, font->data + totalRead, fontSize - totalRead);
-        if (bytesRead == fail || bytesRead == 0) {
-            delete[] font->data;
-            font->data = nullptr;
-            std::close(file);
-            std::memset(font, 0, sizeof(*font));
-            return false;
-        }
-        totalRead += static_cast<std::size_t>(bytesRead);
-    }
-    std::close(file);
-
-    const int fontOffset = stbtt_GetFontOffsetForIndex(font->data, 0);
-    if (fontOffset < 0 || stbtt_InitFont(&font->info, font->data, fontOffset) == 0) {
-        delete[] font->data;
-        font->data = nullptr;
+    std::IPCMessage message = {};
+    if (!std::services::encode_request(&message, infoRequest)) {
+        std::close(font->service);
         std::memset(font, 0, sizeof(*font));
         return false;
     }
 
-    font->scale = stbtt_ScaleForPixelHeight(&font->info, static_cast<float>(kFontPixelHeight));
-    if (font->scale <= 0.0f) {
-        delete[] font->data;
-        font->data = nullptr;
+    std::services::font_manager::FontInfoReply infoReply = {};
+    std::uint64_t replySize = 0;
+    if (std::queue_request(font->service, &message, &infoReply, sizeof(infoReply), &replySize) == fail ||
+        replySize < sizeof(infoReply) ||
+        infoReply.status != std::services::STATUS_OK) {
+        std::close(font->service);
         std::memset(font, 0, sizeof(*font));
         return false;
     }
 
-    stbtt_GetFontVMetrics(&font->info, &font->ascent, &font->descent, &font->lineGap);
-    font->baseline = static_cast<int>(font->ascent * font->scale + 0.999f);
-    font->lineHeight = static_cast<int>(((font->ascent - font->descent + font->lineGap) * font->scale) + 0.999f);
-    if (font->lineHeight <= 0) {
-        font->lineHeight = static_cast<int>(kFontPixelHeight) + 4;
-    }
-
-    int advance = 0;
-    int leftSideBearing = 0;
-    stbtt_GetCodepointHMetrics(&font->info, 'M', &advance, &leftSideBearing);
-    (void) leftSideBearing;
-    font->cellWidth = static_cast<int>(advance * font->scale + 0.999f);
-    if (font->cellWidth <= 0) {
-        font->cellWidth = 8;
-    }
+    font->baseline = infoReply.baseline;
+    font->lineHeight = infoReply.lineHeight;
+    font->cellWidth = infoReply.cellWidth;
 
     for (std::size_t index = 0; index < kCachedGlyphCount; ++index) {
         const int codepoint = static_cast<int>(kFirstCachedGlyph + index);
         GlyphBitmap& glyph = font->glyphs[index];
 
-        int advanceWidth = 0;
-        int glyphLeftSideBearing = 0;
-        stbtt_GetCodepointHMetrics(&font->info, codepoint, &advanceWidth, &glyphLeftSideBearing);
-        (void) glyphLeftSideBearing;
+        std::services::font_manager::GlyphMetricsRequest metricsRequest = {};
+        metricsRequest.header.version = std::services::font_manager::VERSION;
+        metricsRequest.header.opcode = static_cast<std::uint16_t>(std::services::font_manager::Opcode::GetGlyphMetrics);
+        metricsRequest.pixelHeight = kFontPixelHeight;
+        metricsRequest.codepoint = static_cast<std::uint32_t>(codepoint);
+        if (!std::services::encode_request(&message, metricsRequest)) {
+            destroy_font(font);
+            return false;
+        }
 
-        glyph.advance = static_cast<int>(advanceWidth * font->scale + 0.999f);
+        std::services::font_manager::GlyphMetricsReply metricsReply = {};
+        replySize = 0;
+        if (std::queue_request(font->service, &message, &metricsReply, sizeof(metricsReply), &replySize) == fail ||
+            replySize < sizeof(metricsReply) ||
+            metricsReply.status != std::services::STATUS_OK) {
+            destroy_font(font);
+            return false;
+        }
+
+        glyph.width = metricsReply.width;
+        glyph.height = metricsReply.height;
+        glyph.xOffset = metricsReply.xOffset;
+        glyph.yOffset = metricsReply.yOffset;
+        glyph.advance = metricsReply.advance;
         if (glyph.advance <= 0) {
             glyph.advance = font->cellWidth;
         }
 
-        glyph.pixels = stbtt_GetCodepointBitmap(
-            &font->info,
-            font->scale,
-            font->scale,
-            codepoint,
-            &glyph.width,
-            &glyph.height,
-            &glyph.xOffset,
-            &glyph.yOffset
-        );
-        if (!glyph.pixels) {
+        const std::uint64_t pixelCount = static_cast<std::uint64_t>(glyph.width) * static_cast<std::uint64_t>(glyph.height);
+        if (glyph.width <= 0 || glyph.height <= 0 ||
+            glyph.width > static_cast<int>(std::services::font_manager::MAX_GLYPH_ROW_PIXELS) ||
+            pixelCount == 0) {
             glyph.width = 0;
             glyph.height = 0;
             glyph.xOffset = 0;
             glyph.yOffset = 0;
+            continue;
+        }
+
+        glyph.pixels = new (std::nothrow) unsigned char[static_cast<std::size_t>(pixelCount)];
+        if (!glyph.pixels) {
+            destroy_font(font);
+            return false;
+        }
+
+        for (int row = 0; row < glyph.height; ++row) {
+            std::services::font_manager::GlyphRowRequest rowRequest = {};
+            rowRequest.header.version = std::services::font_manager::VERSION;
+            rowRequest.header.opcode = static_cast<std::uint16_t>(std::services::font_manager::Opcode::GetGlyphRow);
+            rowRequest.pixelHeight = kFontPixelHeight;
+            rowRequest.codepoint = static_cast<std::uint32_t>(codepoint);
+            rowRequest.row = static_cast<std::uint32_t>(row);
+            if (!std::services::encode_request(&message, rowRequest)) {
+                destroy_font(font);
+                return false;
+            }
+
+            std::services::font_manager::GlyphRowReply rowReply = {};
+            replySize = 0;
+            if (std::queue_request(font->service, &message, &rowReply, sizeof(rowReply), &replySize) == fail ||
+                replySize < sizeof(rowReply) ||
+                rowReply.status != std::services::STATUS_OK ||
+                rowReply.width != static_cast<std::uint32_t>(glyph.width)) {
+                destroy_font(font);
+                return false;
+            }
+
+            std::memcpy(
+                glyph.pixels + (static_cast<std::size_t>(row) * static_cast<std::size_t>(glyph.width)),
+                rowReply.pixels,
+                static_cast<std::size_t>(glyph.width)
+            );
         }
     }
 
@@ -350,17 +290,19 @@ bool initialize_font(UIFont* font) {
 }
 
 void destroy_font(UIFont* font) {
-    if (!font || !font->valid) {
+    if (!font) {
         return;
     }
 
     for (std::size_t index = 0; index < kCachedGlyphCount; ++index) {
         if (font->glyphs[index].pixels) {
-            stbtt_FreeBitmap(font->glyphs[index].pixels, nullptr);
+            delete[] font->glyphs[index].pixels;
             font->glyphs[index].pixels = nullptr;
         }
     }
-    delete[] font->data;
+    if (font->service != fail && font->service != 0) {
+        std::close(font->service);
+    }
     std::memset(font, 0, sizeof(*font));
 }
 
@@ -602,7 +544,7 @@ void draw_ui(std::uint32_t* pixels, UIFont& font, const AppState& state) {
 
 }
 
-int main() {
+int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv) {
     const std::Handle compositor = connect_service(std::services::graphics_compositor::NAME);
     if (compositor == fail) {
         write_str("[background-switcher] FAIL service_connect graphics.compositor\n");
@@ -682,6 +624,11 @@ int main() {
                 if (event.key.keycode == 27) {
                     state.running = false;
                 } else if (event.key.keycode == '\n' || event.key.keycode == '\r' || key == ' ') {
+                    const std::uint64_t now = std::gettime();
+                    if (now - state.lastApplyMs < kApplyCooldownMs) {
+                        continue;
+                    }
+                    state.lastApplyMs = now;
                     if (state.entryCount != 0 && apply_background(state.entries[state.selected].path)) {
                         set_status(&state, "Background updated", kColorSuccess);
                     } else {

@@ -353,7 +353,7 @@ bool build_glyph_row_reply(const LoadedFont& font, const std::IPCMessage& messag
 }
 }
 
-int main() {
+int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv) {
     LoadedFont font = {};
     if (!load_font(&font)) {
         write_service_line("font load failed\n");

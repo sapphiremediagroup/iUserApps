@@ -4,6 +4,7 @@
 #include <new.hpp>
 #include <service_protocol.hpp>
 #include <syscall.hpp>
+#include <termios.h>
 
 namespace {
 constexpr std::uint64_t fail = static_cast<std::uint64_t>(-1);
@@ -61,6 +62,17 @@ struct TerminalState {
     bool running;
     bool cursorVisible;
     std::uint64_t lastBlinkMs;
+    std::Handle consoleQueue;
+    char stdinBuf[1024];
+    std::uint32_t stdinHead;
+    std::uint32_t stdinTail;
+    termios tty;
+    pid_t foregroundPgid;
+    struct PendingRead {
+        std::uint64_t requestId;
+        std::uint64_t count;
+    } pendingReads[16];
+    std::uint32_t pendingReadCount;
 };
 
 static TerminalState gTerminalState = {};
@@ -616,17 +628,6 @@ bool build_bin_target(const char* name, char* output, std::size_t outputSize) {
     output[0] = '\0';
     append_text(output, outputSize, "/bin/");
     append_text(output, outputSize, name);
-
-    const std::size_t length = std::strlen(output);
-    if (length >= 4 &&
-        output[length - 4] == '.' &&
-        output[length - 3] == 'e' &&
-        output[length - 2] == 'x' &&
-        output[length - 1] == 'e') {
-        return true;
-    }
-
-    append_text(output, outputSize, ".exe");
     return true;
 }
 
@@ -680,7 +681,7 @@ void shell_help(TerminalState* state, std::uint32_t columns) {
     append_wrapped_text(state, "  ls [PATH]     list a directory", columns);
     append_wrapped_text(state, "  cat PATH      print a text file", columns);
     append_wrapped_text(state, "  spawn PATH    start an executable by path", columns);
-    append_wrapped_text(state, "  launch NAME   start /bin/NAME(.exe)", columns);
+    append_wrapped_text(state, "  launch NAME   start /bin/NAME", columns);
     append_wrapped_text(state, "  exit          close the terminal window", columns);
 }
 
@@ -993,8 +994,124 @@ char translate_key(const std::Event& event) {
     return 0;
 }
 
+static bool tty_canonical(const TerminalState& state) {
+    return (state.tty.c_lflag & ICANON) != 0;
+}
+
+static bool tty_echo(const TerminalState& state) {
+    return (state.tty.c_lflag & ECHO) != 0;
+}
+
+static void stdin_push(TerminalState* state, char c) {
+    if (!state) {
+        return;
+    }
+    const std::uint32_t nextTail = (state->stdinTail + 1U) % static_cast<std::uint32_t>(sizeof(state->stdinBuf));
+    if (nextTail != state->stdinHead) {
+        state->stdinBuf[state->stdinTail] = c;
+        state->stdinTail = nextTail;
+    }
+}
+
+static void commit_input_to_stdin(TerminalState* state, bool includeNewline) {
+    if (!state) {
+        return;
+    }
+    for (std::uint32_t i = 0; i < state->inputLength; ++i) {
+        stdin_push(state, state->input[i]);
+    }
+    if (includeNewline) {
+        stdin_push(state, '\n');
+    }
+}
+
+static void clear_input_line(TerminalState* state) {
+    if (!state) {
+        return;
+    }
+    state->inputLength = 0;
+    state->input[0] = '\0';
+}
+
+static void complete_pending_read(TerminalState* state, const void* data, std::uint64_t size) {
+    if (!state || state->consoleQueue == fail || state->pendingReadCount == 0) {
+        return;
+    }
+
+    const std::uint64_t requestId = state->pendingReads[0].requestId;
+    for (std::uint32_t i = 1; i < state->pendingReadCount; ++i) {
+        state->pendingReads[i - 1] = state->pendingReads[i];
+    }
+    state->pendingReadCount--;
+    std::queue_reply(state->consoleQueue, requestId, data, size);
+}
+
 void handle_input(TerminalState* state, char c, std::uint32_t columns) {
     if (!state || c == 0) {
+        return;
+    }
+
+    if (state->pendingReadCount != 0) {
+        if (tty_canonical(*state)) {
+            const char erase = state->tty.c_cc[VERASE] ? static_cast<char>(state->tty.c_cc[VERASE]) : '\b';
+            const char eof = state->tty.c_cc[VEOF] ? static_cast<char>(state->tty.c_cc[VEOF]) : 4;
+            if (c == erase || c == '\b') {
+                if (state->inputLength > 0) {
+                    state->input[--state->inputLength] = '\0';
+                }
+                return;
+            }
+            if (c == eof) {
+                if (state->inputLength == 0) {
+                    complete_pending_read(state, nullptr, 0);
+                    return;
+                }
+                commit_input_to_stdin(state, false);
+                clear_input_line(state);
+                return;
+            }
+            if (c == '\n') {
+                if (tty_echo(*state) && state->inputLength != 0) {
+                    append_wrapped_text(state, state->input, columns);
+                }
+                commit_input_to_stdin(state, true);
+                clear_input_line(state);
+                return;
+            }
+            if (c == '\t') {
+                c = ' ';
+            }
+            if (static_cast<unsigned char>(c) < 32U || static_cast<unsigned char>(c) > 126U) {
+                return;
+            }
+            if (state->inputLength + 1 < kMaxInputChars) {
+                state->input[state->inputLength++] = c;
+                state->input[state->inputLength] = '\0';
+            }
+        } else {
+            if (state->tty.c_iflag & ICRNL) {
+                if (c == '\r') {
+                    c = '\n';
+                }
+            }
+            stdin_push(state, c);
+            if (tty_echo(*state)) {
+                if (c == '\n') {
+                    if (state->inputLength != 0) {
+                        append_wrapped_text(state, state->input, columns);
+                    }
+                    clear_input_line(state);
+                } else if (c == '\b') {
+                    if (state->inputLength > 0) {
+                        state->input[--state->inputLength] = '\0';
+                    }
+                } else if (static_cast<unsigned char>(c) >= 32U && static_cast<unsigned char>(c) <= 126U &&
+                           state->inputLength + 1 < kMaxInputChars) {
+                    state->input[state->inputLength++] = c;
+                    state->input[state->inputLength] = '\0';
+                }
+            }
+        }
         return;
     }
 
@@ -1052,8 +1169,11 @@ void draw_terminal(std::uint32_t* pixels, UIFont& font, const TerminalState& sta
 
     const std::uint32_t promptColumns = static_cast<std::uint32_t>(std::strlen(prompt));
     std::uint32_t visibleInputOffset = 0;
-    if (columns > promptColumns + 1 && state.inputLength > (columns - promptColumns - 1)) {
-        visibleInputOffset = state.inputLength - (columns - promptColumns - 1);
+    const bool suppressEcho = state.pendingReadCount != 0 && !tty_echo(state);
+    const std::uint32_t displayInputLength = suppressEcho ? 0 : state.inputLength;
+    const char* displayInput = suppressEcho ? "" : state.input;
+    if (columns > promptColumns + 1 && displayInputLength > (columns - promptColumns - 1)) {
+        visibleInputOffset = displayInputLength - (columns - promptColumns - 1);
     }
     draw_text(
         pixels,
@@ -1062,12 +1182,12 @@ void draw_terminal(std::uint32_t* pixels, UIFont& font, const TerminalState& sta
         font,
         kPaddingX + static_cast<int>(promptColumns * font.cellWidth),
         promptBaselineY,
-        state.input + visibleInputOffset,
+        displayInput + visibleInputOffset,
         kColorText
     );
 
     if (state.focused && state.cursorVisible) {
-        const std::uint32_t visibleInputLength = state.inputLength - visibleInputOffset;
+        const std::uint32_t visibleInputLength = displayInputLength - visibleInputOffset;
         const int cursorX = kPaddingX + static_cast<int>((promptColumns + visibleInputLength) * font.cellWidth);
         const int cursorY = promptBaselineY - font.baseline;
         fill_rect(pixels, kSurfaceWidth, kSurfaceHeight, cursorX, cursorY, 2, font.lineHeight, kColorCursor);
@@ -1084,13 +1204,196 @@ void initialize_terminal_state(TerminalState* state, std::uint32_t columns) {
     state->cursorVisible = true;
     state->lastBlinkMs = std::gettime();
     capture_cwd(state);
+    state->tty.c_iflag = ICRNL | IXON;
+    state->tty.c_oflag = OPOST | ONLCR;
+    state->tty.c_cflag = CS8 | CREAD;
+    state->tty.c_lflag = ISIG | ICANON | ECHO | ECHOE;
+    state->tty.c_cc[VINTR] = 3;
+    state->tty.c_cc[VEOF] = 4;
+    state->tty.c_cc[VERASE] = '\b';
+    state->tty.c_cc[VKILL] = 21;
+    state->tty.c_cc[VMIN] = 1;
+    state->tty.c_cc[VTIME] = 0;
+    state->tty.c_cc[VEOL] = '\n';
+    state->tty.c_ispeed = 38400;
+    state->tty.c_ospeed = 38400;
+    state->foregroundPgid = 0;
 
     append_wrapped_text(state, "InstantOS Terminal", columns);
     append_wrapped_text(state, "Type 'help' to see available commands.", columns);
 }
 }
 
-int main() {
+namespace {
+inline constexpr std::uint8_t kConsoleOpWrite = 1;
+inline constexpr std::uint8_t kConsoleOpRead = 2;
+inline constexpr std::uint8_t kConsoleOpGetAttr = 3;
+inline constexpr std::uint8_t kConsoleOpSetAttr = 4;
+inline constexpr std::uint8_t kConsoleOpIsATTY = 5;
+inline constexpr std::uint8_t kConsoleOpGetPgrp = 6;
+inline constexpr std::uint8_t kConsoleOpSetPgrp = 7;
+}
+
+static void service_console_output(TerminalState* state, const std::uint8_t* bytes, std::uint64_t n, std::uint32_t columns) {
+    if (!state || !bytes || n == 0) {
+        return;
+    }
+
+    char line[kMaxLineChars];
+    std::uint32_t pos = 0;
+
+    for (std::uint64_t i = 0; i < n; ++i) {
+        char c = static_cast<char>(bytes[i]);
+        if (c == '\r') {
+            continue;
+        }
+        if (c == '\n') {
+            line[pos] = '\0';
+            append_wrapped_text(state, line, columns);
+            pos = 0;
+            continue;
+        }
+
+        if (static_cast<unsigned char>(c) < 32U || static_cast<unsigned char>(c) > 126U) {
+            c = '?';
+        }
+
+        if (pos + 1 < sizeof(line)) {
+            line[pos++] = c;
+        }
+    }
+
+    if (pos != 0) {
+        line[pos] = '\0';
+        append_wrapped_text(state, line, columns);
+    }
+}
+
+static std::uint32_t stdin_available(const TerminalState& state) {
+    if (state.stdinHead == state.stdinTail) {
+        return 0;
+    }
+    if (state.stdinTail > state.stdinHead) {
+        return state.stdinTail - state.stdinHead;
+    }
+    return static_cast<std::uint32_t>(sizeof(state.stdinBuf)) - state.stdinHead + state.stdinTail;
+}
+
+static std::uint32_t stdin_pop(TerminalState& state, std::uint8_t* out, std::uint32_t maxBytes) {
+    std::uint32_t copied = 0;
+    while (copied < maxBytes && state.stdinHead != state.stdinTail) {
+        out[copied++] = static_cast<std::uint8_t>(state.stdinBuf[state.stdinHead]);
+        state.stdinHead = (state.stdinHead + 1U) % static_cast<std::uint32_t>(sizeof(state.stdinBuf));
+    }
+    return copied;
+}
+
+static void try_satisfy_pending_reads(TerminalState* state, std::uint32_t columns) {
+    (void)columns;
+    if (!state || state->consoleQueue == fail) {
+        return;
+    }
+
+    while (state->pendingReadCount != 0 && stdin_available(*state) != 0) {
+        TerminalState::PendingRead pr = state->pendingReads[0];
+        for (std::uint32_t i = 1; i < state->pendingReadCount; ++i) {
+            state->pendingReads[i - 1] = state->pendingReads[i];
+        }
+        state->pendingReadCount--;
+
+        std::uint8_t reply[256];
+        const std::uint32_t want = pr.count > sizeof(reply) ? static_cast<std::uint32_t>(sizeof(reply)) : static_cast<std::uint32_t>(pr.count);
+        const std::uint32_t n = stdin_pop(*state, reply, want);
+        std::queue_reply(state->consoleQueue, pr.requestId, reply, n);
+    }
+}
+
+static void pump_console_queue(TerminalState* state, std::uint32_t columns, bool* redraw) {
+    if (!state || state->consoleQueue == fail) {
+        return;
+    }
+
+    for (;;) {
+        std::IPCMessage msg = {};
+        if (std::queue_receive(state->consoleQueue, &msg, false) == fail) {
+            break;
+        }
+
+        if ((msg.flags & std::IPC_MESSAGE_REQUEST) != 0) {
+            if (msg.size < 1) {
+                continue;
+            }
+            const std::uint8_t op = msg.data[0];
+
+            if (op == kConsoleOpGetAttr) {
+                std::queue_reply(state->consoleQueue, msg.id, &state->tty, sizeof(state->tty));
+                continue;
+            }
+
+            if (op == kConsoleOpSetAttr) {
+                if (msg.size >= 1 + sizeof(state->tty)) {
+                    std::memcpy(&state->tty, msg.data + 1, sizeof(state->tty));
+                    if (state->tty.c_cc[VMIN] == 0) {
+                        state->tty.c_cc[VMIN] = 1;
+                    }
+                    std::queue_reply(state->consoleQueue, msg.id, nullptr, 0);
+                }
+                continue;
+            }
+
+            if (op == kConsoleOpIsATTY) {
+                const std::uint8_t ok = 1;
+                std::queue_reply(state->consoleQueue, msg.id, &ok, sizeof(ok));
+                continue;
+            }
+
+            if (op == kConsoleOpGetPgrp) {
+                std::queue_reply(state->consoleQueue, msg.id, &state->foregroundPgid, sizeof(state->foregroundPgid));
+                continue;
+            }
+
+            if (op == kConsoleOpSetPgrp) {
+                if (msg.size >= 1 + sizeof(state->foregroundPgid)) {
+                    std::memcpy(&state->foregroundPgid, msg.data + 1, sizeof(state->foregroundPgid));
+                    std::queue_reply(state->consoleQueue, msg.id, nullptr, 0);
+                }
+                continue;
+            }
+
+            if (op == kConsoleOpRead) {
+                std::uint64_t want = 0;
+                if (msg.size >= 1 + sizeof(want)) {
+                    std::memcpy(&want, msg.data + 1, sizeof(want));
+                }
+
+                if (want == 0) {
+                    std::queue_reply(state->consoleQueue, msg.id, nullptr, 0);
+                    continue;
+                }
+
+                if (state->pendingReadCount < (sizeof(state->pendingReads) / sizeof(state->pendingReads[0]))) {
+                    state->pendingReads[state->pendingReadCount++] = { msg.id, want };
+                }
+                try_satisfy_pending_reads(state, columns);
+            }
+            continue;
+        }
+
+        if (msg.size < 2) {
+            continue;
+        }
+        if (msg.data[0] != kConsoleOpWrite) {
+            continue;
+        }
+
+        service_console_output(state, msg.data + 2, msg.size - 2, columns);
+        if (redraw) {
+            *redraw = true;
+        }
+    }
+}
+
+int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv) {
     const std::Handle compositor = connect_service(std::services::graphics_compositor::NAME);
     if (compositor == fail) {
         write_str("[terminal] FAIL service_connect graphics.compositor\n");
@@ -1156,8 +1459,18 @@ int main() {
     TerminalState& terminal = gTerminalState;
     initialize_terminal_state(&terminal, columns);
 
+    terminal.consoleQueue = std::queue_create();
+    if (terminal.consoleQueue != fail) {
+        if (std::service_register("terminal.console", terminal.consoleQueue) == fail) {
+            std::close(terminal.consoleQueue);
+            terminal.consoleQueue = fail;
+        }
+    }
+
     bool redraw = true;
     while (terminal.running) {
+        pump_console_queue(&terminal, columns, &redraw);
+
         for (;;) {
             std::Event event = {};
             if (std::event_poll(events, &event) == fail) {
@@ -1179,6 +1492,7 @@ int main() {
                 const char c = translate_key(event);
                 if (c != 0) {
                     handle_input(&terminal, c, columns);
+                    try_satisfy_pending_reads(&terminal, columns);
                     capture_cwd(&terminal);
                     terminal.cursorVisible = true;
                     terminal.lastBlinkMs = std::gettime();
@@ -1207,6 +1521,9 @@ int main() {
     }
 
     destroy_font(&font);
+    if (terminal.consoleQueue != fail) {
+        std::close(terminal.consoleQueue);
+    }
     std::close(events);
     std::close(window);
     std::close(surface);

@@ -225,7 +225,7 @@ void draw_cube(std::uint32_t* pixels, RotationState& rot) {
 }
 }
 
-int main() {
+int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv) {
     const std::Handle compositor = connect_service(std::services::graphics_compositor::NAME);
     if (compositor == fail) {
         write_str("[cube] FAIL service_connect graphics.compositor\n");

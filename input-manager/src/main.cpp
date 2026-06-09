@@ -12,7 +12,7 @@ void write_str(const char* s) {
 
 }
 
-int main() {
+int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv) {
     write_str("[input.manager] phase=enter\n");
     const std::Handle queue = std::event_queue_create();
     if (queue == fail) {

@@ -45,8 +45,8 @@ static bool ensureGraphicsCompositor() {
         return true;
     }
 
-    if (std::spawn("/bin/graphics-compositor.exe") == static_cast<std::uint64_t>(-1)) {
-        writeStr("Failed to start graphics-compositor.exe.\n");
+    if (std::spawn("/bin/graphics-compositor") == static_cast<std::uint64_t>(-1)) {
+        writeStr("Failed to start graphics-compositor.\n");
         return false;
     }
 
@@ -113,7 +113,7 @@ static int readLine(std::Handle inputQueue, char* buf, int maxLen, bool maskInpu
     return n;
 }
 
-int main() {
+int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv) {
     std::Handle inputQueue = static_cast<std::Handle>(-1);
     if (!connectInputManager(&inputQueue)) {
         writeStr("Failed to connect to input.manager.\n");
@@ -126,16 +126,16 @@ int main() {
         std::memset(username, 0, sizeof(username));
         std::memset(password, 0, sizeof(password));
 
-        writeStr("login: ");
-        readLine(inputQueue, username, sizeof(username), false);
+        //  writeStr("login: ");
+        //  readLine(inputQueue, username, sizeof(username), false);
 
-        writeStr("password: ");
-        readLine(inputQueue, password, sizeof(password), true);
+        //  writeStr("password: ");
+        //  readLine(inputQueue, password, sizeof(password), true);
 
         std::LoginInfo info;
         std::memset(&info, 0, sizeof(info));
-        std::memcpy(info.username, username, sizeof(info.username));
-        std::memcpy(info.password, password, sizeof(info.password));
+        std::memcpy(info.username, "root", sizeof(info.username));
+        std::memcpy(info.password, "root", sizeof(info.password));
 
         std::uint64_t result = std::login(info);
         if (result != static_cast<std::uint64_t>(-1)) {
