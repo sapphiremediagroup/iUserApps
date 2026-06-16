@@ -1,5 +1,7 @@
 sysdep_supported_options = {
   'posix': true,
+  'glibc': true,
+  'bsd': true,
 }
 
 rtld_sources += files(
@@ -32,6 +34,7 @@ if not no_headers
     '../../abis/linux/gid_t.h',
     '../../abis/linux/in.h',
     '../../abis/linux/ino_t.h',
+    '../../abis/linux/ioctls.h',
     '../../abis/linux/limits.h',
     '../../abis/linux/mode_t.h',
     '../../abis/linux/nlink_t.h',
@@ -59,6 +62,8 @@ if not no_headers
     '../../abis/linux/utsname.h',
     '../../abis/linux/vm-flags.h',
     '../../abis/linux/wait.h',
+    '../../abis/linux/utmpx.h',
+    '../../abis/linux/utmp-defines.h',
     subdir: 'abi-bits',
     follow_symlinks: true,
   )
