@@ -99,7 +99,7 @@ struct LoadedFont {
 };
 
 void write_str(const char* s) {
-    std::write(std::STDOUT_HANDLE, s, std::strlen(s));
+    std::serial_write(s, std::strlen(s));
 }
 
 void write_service_line(const char* suffix) {

@@ -32,7 +32,7 @@ const char* state_name(std::uint32_t state)
 
 void write_str(const char* s)
 {
-    std::write(std::STDOUT_HANDLE, s, std::strlen(s));
+    std::serial_write(s, std::strlen(s));
 }
 
 bool handle_request(std::Handle queue, const std::IPCMessage& message)

@@ -1,1 +1,1 @@
-add_user_app(terminal)
+add_instant_window_app(terminal)

@@ -1,1 +1,1 @@
-add_user_app(desktop-shell)
+add_instant_window_app(desktop-shell)

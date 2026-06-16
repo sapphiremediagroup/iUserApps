@@ -1,6 +1,7 @@
 #include <cstdio.hpp>
 #include <cstring.hpp>
 #include <fcntl.h>
+#include <instant/window.hpp>
 #include <math.h>
 #include <new.hpp>
 #include <service_protocol.hpp>
@@ -58,7 +59,7 @@ struct DesktopState {
 };
 
 void write_str(const char* s) {
-    std::write(std::STDOUT_HANDLE, s, std::strlen(s));
+    std::serial_write(s, std::strlen(s));
 }
 
 std::Handle connect_service(const char* name) {
@@ -610,208 +611,140 @@ bool handle_shell_request(std::Handle queue, const std::IPCMessage& message, Des
     return std::queue_reply(queue, message.id, &reply, sizeof(reply)) != fail;
 }
 
+class DesktopShellWindow : public instant::Window {
+private:
+    instant::WindowConfig configure() override {
+        instant::WindowConfig config = {};
+        config.width = static_cast<int>(kSurfaceWidth);
+        config.height = static_cast<int>(kSurfaceHeight);
+        config.title = "Desktop Shell";
+        config.frameIntervalMs = kAnimationTickMs;
+        return config;
+    }
+
+    Result<bool, std::string> init() override {
+        serviceQueue_ = std::queue_create();
+        if (serviceQueue_ == fail || std::service_register(std::services::desktop_shell::NAME, serviceQueue_) == fail) {
+            if (serviceQueue_ != fail) {
+                std::close(serviceQueue_);
+                serviceQueue_ = fail;
+            }
+            return Result<bool, std::string>::error("desktop.shell service_register failed");
+        }
+
+        state_ = {};
+        state_.activitySeed = 1;
+        load_first_available_background(&state_);
+        draw_desktop(pixels(), state_);
+
+        write_str("[desktop-shell] ready\n");
+        if (!state_.terminalStarted) {
+            if (!launch_terminal()) {
+                write_str("[desktop-shell] FAIL autostart terminal\n");
+            }
+            state_.terminalStarted = true;
+        }
+        return true;
+    }
+
+    Result<bool, std::string> event(const std::Event& event) override {
+        if (event.type == std::EventType::Window) {
+            if (event.window.action == std::WindowEventAction::FocusGained) {
+                state_.focused = true;
+                redraw_ = true;
+            } else if (event.window.action == std::WindowEventAction::FocusLost) {
+                state_.focused = false;
+                redraw_ = true;
+            } else if (event.window.action == std::WindowEventAction::CloseRequested) {
+                return false;
+            }
+        } else if (event.type == std::EventType::Pointer) {
+            if (handle_pointer_press(&state_, event)) {
+                redraw_ = true;
+            }
+        } else if (event.type == std::EventType::Key && event.key.action == std::KeyEventAction::Press) {
+            const bool superPressed = (event.key.modifiers & std::KeyModifierSuper) != 0;
+            const char key = event.key.text[0] != '\0' ? event.key.text[0] : static_cast<char>(event.key.keycode);
+            if (superPressed && (key == 't' || key == 'T')) {
+                if (!launch_terminal()) {
+                    write_str("[desktop-shell] FAIL spawn terminal\n");
+                }
+                state_.activitySeed += 29U;
+                redraw_ = true;
+            } else if (superPressed && (key == 'f' || key == 'F')) {
+                if (!launch_file_browser()) {
+                    write_str("[desktop-shell] FAIL spawn file-browser\n");
+                }
+                state_.activitySeed += 31U;
+                redraw_ = true;
+            } else if (superPressed && (key == 'b' || key == 'B')) {
+                if (!launch_background_switcher()) {
+                    write_str("[desktop-shell] FAIL spawn background-switcher\n");
+                }
+                state_.activitySeed += 37U;
+                redraw_ = true;
+            } else if (superPressed && (key == 'c' || key == 'C')) {
+                if (!launch_cube()) {
+                    write_str("[desktop-shell] FAIL spawn cube\n");
+                }
+                state_.activitySeed += 41U;
+                redraw_ = true;
+            } else if (superPressed && (key == 'a' || key == 'A')) {
+                state_.launcherOpen = !state_.launcherOpen;
+                if (state_.launcherOpen) {
+                    refresh_launcher_entries(&state_);
+                }
+                state_.activitySeed += 53U;
+                redraw_ = true;
+            } else {
+                state_.activitySeed += 9U;
+                redraw_ = true;
+            }
+        }
+
+        return true;
+    }
+
+    Result<bool, std::string> update() override {
+        if (serviceQueue_ != fail) {
+            for (;;) {
+                std::IPCMessage message = {};
+                if (std::queue_receive(serviceQueue_, &message, false) == fail) {
+                    break;
+                }
+
+                if (!handle_shell_request(serviceQueue_, message, &state_, &redraw_)) {
+                    write_str("[desktop-shell] FAIL service request handling\n");
+                }
+            }
+        }
+
+        state_.activitySeed += state_.focused ? 5U : 2U;
+        redraw_ = true;
+        if (redraw_) {
+            draw_desktop(pixels(), state_);
+            redraw_ = false;
+        }
+        return true;
+    }
+
+    Result<bool, std::string> event() override {
+        return true;
+    }
+
+    void cleanup() override {
+        delete[] state_.wallpaper;
+        state_.wallpaper = nullptr;
+        if (serviceQueue_ != fail) {
+            std::close(serviceQueue_);
+            serviceQueue_ = fail;
+        }
+    }
+
+    DesktopState state_ = {};
+    std::Handle serviceQueue_ = fail;
+    bool redraw_ = false;
+};
 }
 
-int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv) {
-    write_str("[desktop-shell] connecting to graphics.compositor\n");
-    const std::Handle compositor = connect_service(std::services::graphics_compositor::NAME);
-    if (compositor == fail) {
-        write_str("[desktop-shell] FAIL service_connect graphics.compositor\n");
-        return 1;
-    }
-    write_str("[desktop-shell] SUCCESS service_connect graphics.compositor\n");
-
-    const std::Handle surface = std::surface_create(kSurfaceWidth, kSurfaceHeight, std::services::surfaces::FORMAT_BGRA8);
-    if (surface == fail) {
-        write_str("[desktop-shell] FAIL surface_create\n");
-        std::close(compositor);
-        return 1;
-    }
-    write_str("[desktop-shell] SUCCESS surface_create\n");
-
-    auto* pixels = static_cast<std::uint32_t*>(std::shared_map(surface));
-    if (pixels == reinterpret_cast<std::uint32_t*>(fail) || pixels == nullptr) {
-        write_str("[desktop-shell] FAIL shared_map(surface)\n");
-        std::close(surface);
-        std::close(compositor);
-        return 1;
-    }
-    write_str("[desktop-shell] SUCCESS shared_map(surface)\n");
-
-    const std::Handle window = std::compositor_create_window(compositor, kSurfaceWidth, kSurfaceHeight, 0);
-    if (window == fail) {
-        write_str("[desktop-shell] FAIL compositor_create_window\n");
-        std::close(surface);
-        std::close(compositor);
-        return 1;
-    }
-    write_str("[desktop-shell] SUCCESS compositor_create_window\n");
-
-    if (std::window_set_title(window, "Desktop Shell") == fail) {
-        write_str("[desktop-shell] FAIL window_set_title\n");
-        std::close(window);
-        std::close(surface);
-        std::close(compositor);
-        return 1;
-    }
-    write_str("[desktop-shell] SUCCESS window_set_title\n");
-
-    if (std::window_attach_surface(window, surface) == fail) {
-        write_str("[desktop-shell] FAIL window_attach_surface\n");
-        std::close(window);
-        std::close(surface);
-        std::close(compositor);
-        return 1;
-    }
-    write_str("[desktop-shell] SUCCESS window_attach_surface\n");
-
-    const std::Handle events = std::window_event_queue(window);
-    if (events == fail) {
-        write_str("[desktop-shell] FAIL window_event_queue\n");
-        std::close(window);
-        std::close(surface);
-        std::close(compositor);
-        return 1;
-    }
-    write_str("[desktop-shell] SUCCESS window_event_queue\n");
-
-    const std::Handle serviceQueue = std::queue_create();
-    if (serviceQueue == fail || std::service_register(std::services::desktop_shell::NAME, serviceQueue) == fail) {
-        write_str("[desktop-shell] FAIL desktop.shell service_register\n");
-        if (serviceQueue != fail) {
-            std::close(serviceQueue);
-        }
-        std::close(events);
-        std::close(window);
-        std::close(surface);
-        std::close(compositor);
-        return 1;
-    }
-    write_str("[desktop-shell] SUCCESS desktop.shell service_register\n");
-
-    DesktopState state = {};
-    state.activitySeed = 1;
-    load_first_available_background(&state);
-
-    draw_desktop(pixels, state);
-    if (std::surface_commit(surface, 0, 0, kSurfaceWidth, kSurfaceHeight) == fail) {
-        write_str("[desktop-shell] FAIL initial surface_commit\n");
-        std::close(serviceQueue);
-        std::close(events);
-        std::close(window);
-        std::close(surface);
-        std::close(compositor);
-        return 1;
-    }
-    write_str("[desktop-shell] SUCCESS initial surface_commit\n");
-    write_str("[desktop-shell] ready\n");
-    if (!state.terminalStarted) {
-        if (!launch_terminal()) {
-            write_str("[desktop-shell] FAIL autostart terminal\n");
-        }
-        state.terminalStarted = true;
-    }
-
-    for (;;) {
-        bool redraw = false;
-
-        for (;;) {
-            std::Event event = {};
-            if (std::event_poll(events, &event) == fail) {
-                break;
-            }
-
-            if (event.type == std::EventType::Window) {
-                if (event.window.action == std::WindowEventAction::FocusGained) {
-                    state.focused = true;
-                    redraw = true;
-                } else if (event.window.action == std::WindowEventAction::FocusLost) {
-                    state.focused = false;
-                    redraw = true;
-                } else if (event.window.action == std::WindowEventAction::CloseRequested) {
-                    delete[] state.wallpaper;
-                    std::close(serviceQueue);
-                    std::close(events);
-                    std::close(window);
-                    std::close(surface);
-                    std::close(compositor);
-                    return 0;
-                }
-            } else if (event.type == std::EventType::Pointer) {
-                if (handle_pointer_press(&state, event)) {
-                    redraw = true;
-                }
-            } else if (event.type == std::EventType::Key && event.key.action == std::KeyEventAction::Press) {
-                const bool superPressed = (event.key.modifiers & std::KeyModifierSuper) != 0;
-                const char key = event.key.text[0] != '\0' ? event.key.text[0] : static_cast<char>(event.key.keycode);
-                if (superPressed && (key == 't' || key == 'T')) {
-                    if (!launch_terminal()) {
-                        write_str("[desktop-shell] FAIL spawn terminal\n");
-                    }
-                    state.activitySeed += 29U;
-                    redraw = true;
-                } else if (superPressed && (key == 'f' || key == 'F')) {
-                    if (!launch_file_browser()) {
-                        write_str("[desktop-shell] FAIL spawn file-browser\n");
-                    }
-                    state.activitySeed += 31U;
-                    redraw = true;
-                } else if (superPressed && (key == 'b' || key == 'B')) {
-                    if (!launch_background_switcher()) {
-                        write_str("[desktop-shell] FAIL spawn background-switcher\n");
-                    }
-                    state.activitySeed += 37U;
-                    redraw = true;
-                } else if (superPressed && (key == 'c' || key == 'C')) {
-                    if (!launch_cube()) {
-                        write_str("[desktop-shell] FAIL spawn cube\n");
-                    }
-                    state.activitySeed += 41U;
-                    redraw = true;
-                } else if (superPressed && (key == 'a' || key == 'A')) {
-                    state.launcherOpen = !state.launcherOpen;
-                    if (state.launcherOpen) {
-                        refresh_launcher_entries(&state);
-                    }
-                    state.activitySeed += 53U;
-                    redraw = true;
-                } else {
-                    state.activitySeed += 9U;
-                    redraw = true;
-                }
-            }
-        }
-
-        for (;;) {
-            std::IPCMessage message = {};
-            if (std::queue_receive(serviceQueue, &message, false) == fail) {
-                break;
-            }
-
-            if (!handle_shell_request(serviceQueue, message, &state, &redraw)) {
-                write_str("[desktop-shell] FAIL service request handling\n");
-            }
-        }
-
-        state.activitySeed += state.focused ? 5U : 2U;
-        redraw = true;
-
-        if (redraw) {
-            draw_desktop(pixels, state);
-            if (std::surface_commit(surface, 0, 0, kSurfaceWidth, kSurfaceHeight) == fail) {
-                write_str("[desktop-shell] FAIL surface_commit update\n");
-                break;
-            }
-        }
-
-        std::sleep(kAnimationTickMs);
-    }
-
-    delete[] state.wallpaper;
-    std::close(serviceQueue);
-    std::close(events);
-    std::close(window);
-    std::close(surface);
-    std::close(compositor);
-    return 0;
-}
+INSTANT_WINDOW_APP(DesktopShellWindow)

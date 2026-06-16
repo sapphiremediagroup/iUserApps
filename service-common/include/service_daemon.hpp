@@ -10,7 +10,7 @@ namespace service_daemon {
 inline constexpr std::uint64_t fail = static_cast<std::uint64_t>(-1);
 
 inline void write_str(const char* s) {
-    std::write(std::STDOUT_HANDLE, s, std::strlen(s));
+    std::serial_write(s, std::strlen(s));
 }
 
 inline void write_service_line(const char* serviceName, const char* suffix) {

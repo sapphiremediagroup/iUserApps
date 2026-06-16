@@ -20,7 +20,7 @@ int syscall_errno(std::uint64_t result)
 
 void write_str(const char* s)
 {
-    std::write(std::STDOUT_HANDLE, s, std::strlen(s));
+    std::serial_write(s, std::strlen(s));
 }
 
 bool has_flag(std::uint32_t flags, std::uint32_t flag)

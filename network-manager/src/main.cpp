@@ -25,7 +25,7 @@ std::uint64_t net_syscall(std::Syscall number, std::uint64_t arg1 = 0, std::uint
 
 void write_str(const char* s)
 {
-    std::write(std::STDOUT_HANDLE, s, std::strlen(s));
+    std::serial_write(s, std::strlen(s));
 }
 
 bool handle_request(std::Handle queue, const std::IPCMessage& message)

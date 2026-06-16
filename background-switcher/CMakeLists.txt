@@ -1,1 +1,1 @@
-add_user_app(background-switcher)
+add_instant_window_app(background-switcher)

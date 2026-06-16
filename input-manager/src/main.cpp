@@ -7,7 +7,7 @@ namespace {
 constexpr std::uint64_t fail = static_cast<std::uint64_t>(-1);
 
 void write_str(const char* s) {
-    std::write(std::STDOUT_HANDLE, s, std::strlen(s));
+    std::serial_write(s, std::strlen(s));
 }
 
 }

@@ -1,85 +1,15 @@
 #include <cstdint.hpp>
 #include <cstring.hpp>
 #include <fcntl.h>
-#include <cmath.hpp>
-#include <math.h>
-#include <new.hpp>
+#include <instant/font.hpp>
+#include <instant/window.hpp>
 #include <service_protocol.hpp>
+#include <new.hpp>
+#include <svg_renderer.hpp>
 #ifdef NULL
 #undef NULL
 #endif
 #define NULL 0
-
-static double stbtt_local_fmod(double value, double modulus) {
-    return std::fmod(value, modulus);
-}
-
-static double stbtt_local_cuberoot(double value) {
-    if (value == 0.0) {
-        return 0.0;
-    }
-
-    const double sign = value < 0.0 ? -1.0 : 1.0;
-    double guess = std::fabs(value);
-    if (guess < 1.0) {
-        guess = 1.0;
-    }
-
-    for (int iteration = 0; iteration < 24; ++iteration) {
-        guess = (2.0 * guess + std::fabs(value) / (guess * guess)) / 3.0;
-    }
-    return sign * guess;
-}
-
-static double stbtt_local_pow(double value, double exponent) {
-    const double oneThird = 1.0 / 3.0;
-    const double diff = exponent - oneThird;
-    if (diff > -0.000001 && diff < 0.000001) {
-        return stbtt_local_cuberoot(value);
-    }
-
-    if (exponent == 0.0) {
-        return 1.0;
-    }
-    if (exponent == 1.0) {
-        return value;
-    }
-
-    const double integer = std::floor(exponent);
-    if (exponent == integer) {
-        const bool negative = integer < 0.0;
-        std::uint64_t count = static_cast<std::uint64_t>(negative ? -integer : integer);
-        double result = 1.0;
-        for (std::uint64_t index = 0; index < count; ++index) {
-            result *= value;
-        }
-        return negative ? (result == 0.0 ? 0.0 : 1.0 / result) : result;
-    }
-
-    return 1.0;
-}
-
-static double stbtt_local_acos(double value) {
-    if (value <= -1.0) {
-        return 3.14159265358979323846;
-    }
-    if (value >= 1.0) {
-        return 0.0;
-    }
-    return static_cast<double>(acosf(static_cast<float>(value)));
-}
-
-#define STBTT_ifloor(x) static_cast<int>(std::floor(x))
-#define STBTT_iceil(x) static_cast<int>(std::ceil(x))
-#define STBTT_sqrt(x) std::sqrt(x)
-#define STBTT_fmod(x, y) stbtt_local_fmod((x), (y))
-#define STBTT_pow(x, y) stbtt_local_pow((x), (y))
-#define STBTT_cos(x) std::cos(x)
-#define STBTT_acos(x) stbtt_local_acos((x))
-#define STBTT_fabs(x) std::fabs(x)
-#define STBTT_STATIC
-#define STB_TRUETYPE_IMPLEMENTATION
-#include <stb_truetype.h>
 #include <syscall.hpp>
 
 namespace {
@@ -93,10 +23,11 @@ constexpr int kPaddingY = 16;
 constexpr int kHeaderHeight = 0;
 constexpr int kFooterHeight = 0;
 constexpr int kRowGap = 6;
-constexpr char kFontPath[] = "/bin/JetBrainsMono-Regular.ttf";
-constexpr unsigned char kFirstCachedGlyph = 32;
-constexpr unsigned char kLastCachedGlyph = 126;
-constexpr std::size_t kCachedGlyphCount = static_cast<std::size_t>(kLastCachedGlyph - kFirstCachedGlyph + 1);
+constexpr int kEntryIconSize = 18;
+constexpr char kFolderIconPath[] = "/bin/images/folder.svg";
+constexpr char kFileIconPath[] = "/bin/images/file.svg";
+constexpr char kFolderIconFill[] = "#94d2ff";
+constexpr char kFileIconFill[] = "#d5d5d5";
 
 constexpr std::uint32_t kColorBackgroundTop = 0x00111924U;
 constexpr std::uint32_t kColorBackgroundBottom = 0x00182634U;
@@ -111,29 +42,6 @@ constexpr std::uint32_t kColorDirectory = 0x0094d2ffU;
 constexpr std::uint32_t kColorExecutable = 0x0091e6a7U;
 constexpr std::uint32_t kColorFile = 0x00d5d5d5U;
 constexpr std::uint32_t kColorError = 0x00ef8b8bU;
-
-struct GlyphBitmap {
-    unsigned char* pixels;
-    int width;
-    int height;
-    int xOffset;
-    int yOffset;
-    int advance;
-};
-
-struct UIFont {
-    bool valid;
-    unsigned char* data;
-    stbtt_fontinfo info;
-    float scale;
-    int ascent;
-    int descent;
-    int lineGap;
-    int cellWidth;
-    int lineHeight;
-    int baseline;
-    GlyphBitmap glyphs[kCachedGlyphCount];
-};
 
 struct BrowserEntry {
     std::DirEntry dir;
@@ -151,23 +59,17 @@ struct BrowserState {
     bool running;
 };
 
+struct SvgAsset {
+    char* data;
+    std::size_t size;
+    bool ready;
+};
+
 static BrowserState gBrowserState = {};
 static std::DirEntry gDirScratch[kMaxEntries];
 
 void write_str(const char* s) {
-    std::write(std::STDOUT_HANDLE, s, std::strlen(s));
-}
-
-std::Handle connect_service(const char* name) {
-    for (int attempt = 0; attempt < 500; ++attempt) {
-        const std::Handle handle = std::service_connect(name);
-        if (handle != fail) {
-            return handle;
-        }
-        std::yield();
-    }
-
-    return fail;
+    std::serial_write(s, std::strlen(s));
 }
 
 std::uint8_t color_r(std::uint32_t color) {
@@ -186,14 +88,6 @@ std::uint32_t pack_rgb(std::uint8_t r, std::uint8_t g, std::uint8_t b) {
     return (static_cast<std::uint32_t>(r) << 16) |
            (static_cast<std::uint32_t>(g) << 8) |
            static_cast<std::uint32_t>(b);
-}
-
-std::uint32_t blend_rgb(std::uint32_t dst, std::uint32_t src, std::uint8_t alpha) {
-    const std::uint32_t inv = 255U - alpha;
-    const std::uint32_t r = (color_r(dst) * inv + color_r(src) * alpha) / 255U;
-    const std::uint32_t g = (color_g(dst) * inv + color_g(src) * alpha) / 255U;
-    const std::uint32_t b = (color_b(dst) * inv + color_b(src) * alpha) / 255U;
-    return pack_rgb(static_cast<std::uint8_t>(r), static_cast<std::uint8_t>(g), static_cast<std::uint8_t>(b));
 }
 
 void fill_rect(
@@ -314,181 +208,123 @@ void format_uint(std::uint64_t value, char* out, std::size_t outSize) {
     out[writePos] = '\0';
 }
 
-bool initialize_font(UIFont* font) {
-    if (!font) {
+void destroy_svg_asset(SvgAsset* asset) {
+    if (!asset) {
+        return;
+    }
+
+    delete[] asset->data;
+    asset->data = nullptr;
+    asset->size = 0;
+    asset->ready = false;
+}
+
+bool is_svg_root_at(const char* data, std::size_t size, std::size_t index) {
+    if (index + 4 > size) {
+        return false;
+    }
+    if (data[index] != '<' || data[index + 1] != 's' || data[index + 2] != 'v' || data[index + 3] != 'g') {
+        return false;
+    }
+    return index + 4 == size || data[index + 4] == '>' || data[index + 4] == ' ' || data[index + 4] == '\t' || data[index + 4] == '\n' || data[index + 4] == '\r';
+}
+
+bool load_svg_asset(SvgAsset* asset, const char* path, const char* fill) {
+    if (!asset || !path || !fill) {
         return false;
     }
 
-    std::memset(font, 0, sizeof(*font));
+    destroy_svg_asset(asset);
+
     std::Stat stat = {};
-    if (std::stat(kFontPath, &stat) == fail || stat.st_size == 0) {
+    if (std::stat(path, &stat) == fail || stat.st_size == 0) {
         return false;
     }
 
-    const std::Handle file = std::open(kFontPath, O_RDONLY);
+    const std::Handle file = std::open(path, O_RDONLY);
     if (file == fail) {
         return false;
     }
 
-    const std::size_t fontSize = static_cast<std::size_t>(stat.st_size);
-    font->data = new (std::nothrow) unsigned char[fontSize];
-    if (!font->data) {
+    const std::size_t fileSize = static_cast<std::size_t>(stat.st_size);
+    char* raw = new (std::nothrow) char[fileSize + 1];
+    if (!raw) {
         std::close(file);
         return false;
     }
 
     std::size_t totalRead = 0;
-    while (totalRead < fontSize) {
-        const std::uint64_t bytesRead = std::read(file, font->data + totalRead, fontSize - totalRead);
+    while (totalRead < fileSize) {
+        const std::uint64_t bytesRead = std::read(file, raw + totalRead, fileSize - totalRead);
         if (bytesRead == fail || bytesRead == 0) {
-            delete[] font->data;
-            font->data = nullptr;
+            delete[] raw;
             std::close(file);
-            std::memset(font, 0, sizeof(*font));
             return false;
         }
         totalRead += static_cast<std::size_t>(bytesRead);
     }
     std::close(file);
+    raw[fileSize] = '\0';
 
-    const int fontOffset = stbtt_GetFontOffsetForIndex(font->data, 0);
-    if (fontOffset < 0 || stbtt_InitFont(&font->info, font->data, fontOffset) == 0) {
-        delete[] font->data;
-        font->data = nullptr;
-        std::memset(font, 0, sizeof(*font));
-        return false;
-    }
-
-    font->scale = stbtt_ScaleForPixelHeight(&font->info, static_cast<float>(kFontPixelHeight));
-    if (font->scale <= 0.0f) {
-        delete[] font->data;
-        font->data = nullptr;
-        std::memset(font, 0, sizeof(*font));
-        return false;
-    }
-
-    stbtt_GetFontVMetrics(&font->info, &font->ascent, &font->descent, &font->lineGap);
-    font->baseline = static_cast<int>(font->ascent * font->scale + 0.999f);
-    font->lineHeight = static_cast<int>(((font->ascent - font->descent + font->lineGap) * font->scale) + 0.999f);
-    if (font->lineHeight <= 0) {
-        font->lineHeight = static_cast<int>(kFontPixelHeight) + 4;
-    }
-
-    int advance = 0;
-    int leftSideBearing = 0;
-    stbtt_GetCodepointHMetrics(&font->info, 'M', &advance, &leftSideBearing);
-    (void) leftSideBearing;
-    font->cellWidth = static_cast<int>(advance * font->scale + 0.999f);
-    if (font->cellWidth <= 0) {
-        font->cellWidth = 8;
-    }
-
-    for (std::size_t index = 0; index < kCachedGlyphCount; ++index) {
-        const int codepoint = static_cast<int>(kFirstCachedGlyph + index);
-        GlyphBitmap& glyph = font->glyphs[index];
-
-        int advanceWidth = 0;
-        int glyphLeftSideBearing = 0;
-        stbtt_GetCodepointHMetrics(&font->info, codepoint, &advanceWidth, &glyphLeftSideBearing);
-        (void) glyphLeftSideBearing;
-
-        glyph.advance = static_cast<int>(advanceWidth * font->scale + 0.999f);
-        if (glyph.advance <= 0) {
-            glyph.advance = font->cellWidth;
-        }
-
-        glyph.pixels = stbtt_GetCodepointBitmap(
-            &font->info,
-            font->scale,
-            font->scale,
-            codepoint,
-            &glyph.width,
-            &glyph.height,
-            &glyph.xOffset,
-            &glyph.yOffset
-        );
-        if (!glyph.pixels) {
-            glyph.width = 0;
-            glyph.height = 0;
-            glyph.xOffset = 0;
-            glyph.yOffset = 0;
+    std::size_t insertAt = 0;
+    bool foundRoot = false;
+    for (std::size_t index = 0; index < fileSize; ++index) {
+        if (is_svg_root_at(raw, fileSize, index)) {
+            insertAt = index + 4;
+            foundRoot = true;
+            break;
         }
     }
 
-    font->valid = true;
+    static constexpr char fillPrefix[] = " fill=\"";
+    static constexpr char fillSuffix[] = "\"";
+    const std::size_t fillLength = std::strlen(fill);
+    const std::size_t extra = foundRoot ? (sizeof(fillPrefix) - 1 + fillLength + sizeof(fillSuffix) - 1) : 0;
+    char* data = new (std::nothrow) char[fileSize + extra + 1];
+    if (!data) {
+        delete[] raw;
+        return false;
+    }
+
+    if (foundRoot) {
+        std::memcpy(data, raw, insertAt);
+        std::size_t cursor = insertAt;
+        std::memcpy(data + cursor, fillPrefix, sizeof(fillPrefix) - 1);
+        cursor += sizeof(fillPrefix) - 1;
+        std::memcpy(data + cursor, fill, fillLength);
+        cursor += fillLength;
+        std::memcpy(data + cursor, fillSuffix, sizeof(fillSuffix) - 1);
+        cursor += sizeof(fillSuffix) - 1;
+        std::memcpy(data + cursor, raw + insertAt, fileSize - insertAt);
+    } else {
+        std::memcpy(data, raw, fileSize);
+    }
+
+    delete[] raw;
+    asset->data = data;
+    asset->size = fileSize + extra;
+    asset->data[asset->size] = '\0';
+    asset->ready = true;
     return true;
 }
 
-void destroy_font(UIFont* font) {
-    if (!font || !font->valid) {
+void draw_entry_icon(std::uint32_t* pixels, const SvgAsset& icon, int x, int y) {
+    if (!pixels || !icon.ready || !icon.data) {
         return;
     }
 
-    for (std::size_t index = 0; index < kCachedGlyphCount; ++index) {
-        if (font->glyphs[index].pixels) {
-            stbtt_FreeBitmap(font->glyphs[index].pixels, nullptr);
-            font->glyphs[index].pixels = nullptr;
-        }
-    }
-    delete[] font->data;
-    std::memset(font, 0, sizeof(*font));
-}
-
-void draw_text(
-    std::uint32_t* pixels,
-    std::uint32_t surfaceWidth,
-    std::uint32_t surfaceHeight,
-    UIFont& font,
-    int x,
-    int baselineY,
-    const char* text,
-    std::uint32_t color
-) {
-    if (!pixels || !font.valid || !text) {
-        return;
-    }
-
-    int penX = x;
-    for (std::size_t index = 0; text[index] != '\0'; ++index) {
-        const unsigned char ch = static_cast<unsigned char>(text[index]);
-        if (ch < kFirstCachedGlyph || ch > kLastCachedGlyph) {
-            penX += font.cellWidth;
-            continue;
-        }
-
-        const GlyphBitmap& glyph = font.glyphs[ch - kFirstCachedGlyph];
-        if (!glyph.pixels || glyph.width <= 0 || glyph.height <= 0) {
-            penX += glyph.advance > 0 ? glyph.advance : font.cellWidth;
-            continue;
-        }
-
-        const int startX = penX + glyph.xOffset;
-        const int startY = baselineY + glyph.yOffset;
-
-        for (int drawY = 0; drawY < glyph.height; ++drawY) {
-            const int dstY = startY + drawY;
-            if (dstY < 0 || dstY >= static_cast<int>(surfaceHeight)) {
-                continue;
-            }
-
-            for (int drawX = 0; drawX < glyph.width; ++drawX) {
-                const int dstX = startX + drawX;
-                if (dstX < 0 || dstX >= static_cast<int>(surfaceWidth)) {
-                    continue;
-                }
-
-                const std::uint8_t alpha = glyph.pixels[drawY * glyph.width + drawX];
-                if (alpha == 0) {
-                    continue;
-                }
-
-                std::uint32_t& dst = pixels[dstY * surfaceWidth + dstX];
-                dst = blend_rgb(dst, color, alpha);
-            }
-        }
-
-        penX += glyph.advance > 0 ? glyph.advance : font.cellWidth;
-    }
+    std::SvgRenderer::PixelBuffer target = {
+        pixels,
+        static_cast<int>(kSurfaceWidth),
+        static_cast<int>(kSurfaceHeight),
+        static_cast<int>(kSurfaceWidth)
+    };
+    std::SvgRenderer::RenderOptions options = std::SvgRenderer::default_options();
+    options.x = x;
+    options.y = y;
+    options.width = kEntryIconSize;
+    options.height = kEntryIconSize;
+    std::SvgRenderer::render(icon.data, icon.size, target, options);
 }
 
 char ascii_lower(char c) {
@@ -803,7 +639,7 @@ std::uint32_t entry_color(const BrowserEntry& entry) {
     return kColorFile;
 }
 
-void draw_browser(std::uint32_t* pixels, UIFont& font, const BrowserState& state) {
+void draw_browser(std::uint32_t* pixels, instant::UIFont& font, const BrowserState& state, const SvgAsset& folderIcon, const SvgAsset& fileIcon) {
     draw_gradient(pixels);
     fill_rect(
         pixels,
@@ -822,7 +658,7 @@ void draw_browser(std::uint32_t* pixels, UIFont& font, const BrowserState& state
         static_cast<std::uint32_t>((static_cast<int>(kSurfaceHeight) - listTop - kFooterHeight - 24) / rowHeight);
 
     if (state.entryCount == 0) {
-        draw_text(pixels, kSurfaceWidth, kSurfaceHeight, font, kPaddingX + 14, listTop + font.baseline, "(no entries)", kColorDim);
+        instant::draw_text(pixels, kSurfaceWidth, kSurfaceHeight, font, kPaddingX + 14, listTop + font.baseline, "(no entries)", kColorDim);
     } else {
         for (std::uint32_t row = 0; row < visibleRows; ++row) {
             const std::uint32_t index = state.scroll + row;
@@ -848,21 +684,33 @@ void draw_browser(std::uint32_t* pixels, UIFont& font, const BrowserState& state
 
             char line[320];
             line[0] = '\0';
+            const bool directory = entry.dir.type == std::FileType::Directory;
+            const SvgAsset& icon = directory ? folderIcon : fileIcon;
             if (entry.dir.type == std::FileType::Directory) {
-                append_text(line, sizeof(line), "[dir] ");
+                if (!folderIcon.ready) {
+                    append_text(line, sizeof(line), "[dir] ");
+                }
             } else if (entry.executable) {
-                append_text(line, sizeof(line), "[exe] ");
+                if (!fileIcon.ready) {
+                    append_text(line, sizeof(line), "[exe] ");
+                }
             } else {
-                append_text(line, sizeof(line), "[file] ");
+                if (!fileIcon.ready) {
+                    append_text(line, sizeof(line), "[file] ");
+                }
             }
             append_text(line, sizeof(line), entry.dir.name);
 
-            draw_text(
+            if (icon.ready) {
+                draw_entry_icon(pixels, icon, kPaddingX + 18, rowY + 1);
+            }
+
+            instant::draw_text(
                 pixels,
                 kSurfaceWidth,
                 kSurfaceHeight,
                 font,
-                kPaddingX + 18,
+                icon.ready ? (kPaddingX + 18 + kEntryIconSize + 8) : (kPaddingX + 18),
                 rowY + font.baseline,
                 line,
                 selected ? kColorText : entry_color(entry)
@@ -881,149 +729,121 @@ void initialize_state(BrowserState* state) {
     copy_string(state->status, sizeof(state->status), "loading /bin");
     state->running = true;
 }
-}
-
-int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv) {
-    const std::Handle compositor = connect_service(std::services::graphics_compositor::NAME);
-    if (compositor == fail) {
-        write_str("[file-browser] FAIL service_connect graphics.compositor\n");
-        return 1;
+class FileBrowserWindow : public instant::Window {
+private:
+    instant::WindowConfig configure() override {
+        instant::WindowConfig config = {};
+        config.width = static_cast<int>(kSurfaceWidth);
+        config.height = static_cast<int>(kSurfaceHeight);
+        config.title = "File Browser";
+        config.frameIntervalMs = 16;
+        config.autoCommit = false;
+        return config;
     }
 
-    const std::Handle surface = std::surface_create(
-        kSurfaceWidth,
-        kSurfaceHeight,
-        std::services::surfaces::FORMAT_BGRA8
-    );
-    if (surface == fail) {
-        write_str("[file-browser] FAIL surface_create\n");
-        std::close(compositor);
-        return 1;
-    }
-
-    auto* pixels = static_cast<std::uint32_t*>(std::shared_map(surface));
-    if (pixels == reinterpret_cast<std::uint32_t*>(fail) || pixels == nullptr) {
-        write_str("[file-browser] FAIL shared_map(surface)\n");
-        std::close(surface);
-        std::close(compositor);
-        return 1;
-    }
-
-    const std::Handle window = std::compositor_create_window(compositor, kSurfaceWidth, kSurfaceHeight, 0);
-    if (window == fail) {
-        write_str("[file-browser] FAIL compositor_create_window\n");
-        std::close(surface);
-        std::close(compositor);
-        return 1;
-    }
-
-    if (std::window_set_title(window, "File Browser") == fail ||
-        std::window_attach_surface(window, surface) == fail) {
-        write_str("[file-browser] FAIL window setup\n");
-        std::close(window);
-        std::close(surface);
-        std::close(compositor);
-        return 1;
-    }
-
-    const std::Handle events = std::window_event_queue(window);
-    if (events == fail) {
-        write_str("[file-browser] FAIL window_event_queue\n");
-        std::close(window);
-        std::close(surface);
-        std::close(compositor);
-        return 1;
-    }
-
-    UIFont font = {};
-    if (!initialize_font(&font)) {
-        write_str("[file-browser] FAIL font init\n");
-        std::close(events);
-        std::close(window);
-        std::close(surface);
-        std::close(compositor);
-        return 1;
-    }
-
-    BrowserState& state = gBrowserState;
-    initialize_state(&state);
-    load_directory(&state);
-    draw_browser(pixels, font, state);
-    if (std::surface_commit(surface, 0, 0, kSurfaceWidth, kSurfaceHeight) == fail) {
-        write_str("[file-browser] FAIL initial surface_commit\n");
-        destroy_font(&font);
-        std::close(events);
-        std::close(window);
-        std::close(surface);
-        std::close(compositor);
-        return 1;
-    }
-
-    const int rowHeight = font.lineHeight + kRowGap;
-    const int listTop = kHeaderHeight + 24;
-    const std::uint32_t visibleRows =
-        static_cast<std::uint32_t>((static_cast<int>(kSurfaceHeight) - listTop - kFooterHeight - 24) / rowHeight);
-
-    while (state.running) {
-        std::Event event = {};
-        if (std::event_wait(events, &event) == fail) {
-            std::yield();
-            continue;
+    Result<bool, std::string> init() override {
+        if (!instant::initialize_ui_font(kFontPixelHeight)) {
+            return Result<bool, std::string>::error("font init failed");
         }
 
-        bool redraw = false;
+        state_ = &gBrowserState;
+        load_svg_asset(&folderIcon_, kFolderIconPath, kFolderIconFill);
+        load_svg_asset(&fileIcon_, kFileIconPath, kFileIconFill);
+        initialize_state(state_);
+        load_directory(state_);
+
+        const int rowHeight = instant::gUIFont.lineHeight + kRowGap;
+        const int listTop = kHeaderHeight + 24;
+        visibleRows_ = static_cast<std::uint32_t>((static_cast<int>(kSurfaceHeight) - listTop - kFooterHeight - 24) / rowHeight);
+        if (visibleRows_ == 0) {
+            visibleRows_ = 1;
+        }
+
+        draw_browser(pixels(), instant::gUIFont, *state_, folderIcon_, fileIcon_);
+        if (!commit()) {
+            return Result<bool, std::string>::error("initial surface_commit failed");
+        }
+        return true;
+    }
+
+    Result<bool, std::string> update() override {
+        if (!dirty_) {
+            return true;
+        }
+
+        draw_browser(pixels(), instant::gUIFont, *state_, folderIcon_, fileIcon_);
+        if (!commit()) {
+            return Result<bool, std::string>::error("surface_commit update failed");
+        }
+        dirty_ = false;
+        return true;
+    }
+
+    Result<bool, std::string> event(const std::Event& event) override {
+        if (!state_) {
+            return true;
+        }
+
         if (event.type == std::EventType::Window) {
             if (event.window.action == std::WindowEventAction::FocusGained) {
-                state.focused = true;
-                redraw = true;
+                state_->focused = true;
+                dirty_ = true;
             } else if (event.window.action == std::WindowEventAction::FocusLost) {
-                state.focused = false;
-                redraw = true;
+                state_->focused = false;
+                dirty_ = true;
             } else if (event.window.action == std::WindowEventAction::CloseRequested) {
-                state.running = false;
-                break;
+                state_->running = false;
+                return false;
             }
-        } else {
-            const char key = translate_key(event);
-            if (key == 0) {
-                continue;
-            }
-
-            const char lowered = ascii_lower(key);
-            if (key == '\b') {
-                open_parent_directory(&state);
-                redraw = true;
-            } else if (key == '\n') {
-                open_selected_entry(&state);
-                redraw = true;
-            } else if (lowered == 'j' || lowered == 's') {
-                move_selection(&state, 1, visibleRows);
-                redraw = true;
-            } else if (lowered == 'k' || lowered == 'w') {
-                move_selection(&state, -1, visibleRows);
-                redraw = true;
-            } else if (lowered == 'r') {
-                load_directory(&state);
-                redraw = true;
-            } else if (lowered == 'q') {
-                state.running = false;
-                break;
-            }
+            return state_->running;
         }
 
-        if (redraw) {
-            draw_browser(pixels, font, state);
-            if (std::surface_commit(surface, 0, 0, kSurfaceWidth, kSurfaceHeight) == fail) {
-                write_str("[file-browser] FAIL surface_commit update\n");
-                break;
-            }
+        const char key = translate_key(event);
+        if (key == 0) {
+            return true;
         }
+
+        const char lowered = ascii_lower(key);
+        if (key == '\b') {
+            open_parent_directory(state_);
+            dirty_ = true;
+        } else if (key == '\n') {
+            open_selected_entry(state_);
+            dirty_ = true;
+        } else if (lowered == 'j' || lowered == 's') {
+            move_selection(state_, 1, visibleRows_);
+            dirty_ = true;
+        } else if (lowered == 'k' || lowered == 'w') {
+            move_selection(state_, -1, visibleRows_);
+            dirty_ = true;
+        } else if (lowered == 'r') {
+            load_directory(state_);
+            dirty_ = true;
+        } else if (lowered == 'q') {
+            state_->running = false;
+            close();
+            return false;
+        }
+
+        return state_->running;
     }
 
-    destroy_font(&font);
-    std::close(events);
-    std::close(window);
-    std::close(surface);
-    std::close(compositor);
-    return 0;
+    Result<bool, std::string> event() override {
+        return true;
+    }
+
+    void cleanup() override {
+        instant::destroy_ui_font();
+        destroy_svg_asset(&folderIcon_);
+        destroy_svg_asset(&fileIcon_);
+    }
+
+    BrowserState* state_ = nullptr;
+    SvgAsset folderIcon_ = {};
+    SvgAsset fileIcon_ = {};
+    std::uint32_t visibleRows_ = 1;
+    bool dirty_ = false;
+};
 }
+
+INSTANT_WINDOW_APP(FileBrowserWindow)

@@ -4,7 +4,7 @@
 #include <service_protocol.hpp>
 
 static void writeStr(const char* s) {
-    std::write(1, s, std::strlen(s));
+    std::serial_write(s, std::strlen(s));
 }
 
 static bool connectInputManager(std::Handle* outHandle) {

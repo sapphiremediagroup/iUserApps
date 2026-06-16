@@ -1,5 +1,6 @@
 #include <cstdint.hpp>
 #include <cstring.hpp>
+#include <instant/window.hpp>
 #include <service_protocol.hpp>
 #include <syscall.hpp>
 
@@ -46,20 +47,8 @@ struct RotationState {
     int sinY;
 };
 
-std::Handle connect_service(const char* name) {
-    for (int attempt = 0; attempt < 500; ++attempt) {
-        const std::Handle handle = std::service_connect(name);
-        if (handle != fail) {
-            return handle;
-        }
-        std::yield();
-    }
-
-    return fail;
-}
-
 void write_str(const char* s) {
-    std::write(std::STDOUT_HANDLE, s, std::strlen(s));
+    std::serial_write(s, std::strlen(s));
 }
 
 void clear_screen(std::uint32_t* pixels, std::uint32_t color) {
@@ -223,100 +212,37 @@ void draw_cube(std::uint32_t* pixels, RotationState& rot) {
 
     update_rotation(rot);
 }
+
+class CubeWindow : public instant::Window {
+private:
+    instant::WindowConfig configure() override {
+        instant::WindowConfig config = {};
+        config.width = static_cast<int>(kSurfaceWidth);
+        config.height = static_cast<int>(kSurfaceHeight);
+        config.title = "Cube";
+        config.frameIntervalMs = kFrameIntervalMs;
+        return config;
+    }
+
+    Result<bool, std::string> init() override {
+        rotation_.cosX = kFixedOne;
+        rotation_.sinX = 0;
+        rotation_.cosY = kFixedOne;
+        rotation_.sinY = 0;
+        return true;
+    }
+
+    Result<bool, std::string> update() override {
+        draw_cube(pixels(), rotation_);
+        return true;
+    }
+
+    Result<bool, std::string> event() override {
+        return true;
+    }
+
+    RotationState rotation_ = {};
+};
 }
 
-int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv) {
-    const std::Handle compositor = connect_service(std::services::graphics_compositor::NAME);
-    if (compositor == fail) {
-        write_str("[cube] FAIL service_connect graphics.compositor\n");
-        return 1;
-    }
-
-    const std::Handle surface = std::surface_create(
-        kSurfaceWidth,
-        kSurfaceHeight,
-        std::services::surfaces::FORMAT_BGRA8
-    );
-    if (surface == fail) {
-        write_str("[cube] FAIL surface_create\n");
-        std::close(compositor);
-        return 1;
-    }
-
-    auto* pixels = static_cast<std::uint32_t*>(std::shared_map(surface));
-    if (pixels == reinterpret_cast<std::uint32_t*>(fail) || pixels == nullptr) {
-        write_str("[cube] FAIL shared_map(surface)\n");
-        std::close(surface);
-        std::close(compositor);
-        return 1;
-    }
-
-    const std::Handle window = std::compositor_create_window(
-        compositor,
-        kSurfaceWidth,
-        kSurfaceHeight,
-        0
-    );
-    if (window == fail) {
-        write_str("[cube] FAIL compositor_create_window\n");
-        std::close(surface);
-        std::close(compositor);
-        return 1;
-    }
-
-    if (std::window_set_title(window, "Cube") == fail ||
-        std::window_attach_surface(window, surface) == fail) {
-        write_str("[cube] FAIL window setup\n");
-        std::close(window);
-        std::close(surface);
-        std::close(compositor);
-        return 1;
-    }
-
-    const std::Handle events = std::window_event_queue(window);
-    if (events == fail) {
-        write_str("[cube] FAIL window_event_queue\n");
-        std::close(window);
-        std::close(surface);
-        std::close(compositor);
-        return 1;
-    }
-
-    RotationState rotation = {};
-    rotation.cosX = kFixedOne;
-    rotation.sinX = 0;
-    rotation.cosY = kFixedOne;
-    rotation.sinY = 0;
-
-    bool running = true;
-
-    while (running) {
-        for (;;) {
-            std::Event event = {};
-            if (std::event_poll(events, &event) == fail) {
-                break;
-            }
-
-            if (event.type == std::EventType::Window &&
-                event.window.action == std::WindowEventAction::CloseRequested) {
-                running = false;
-                break;
-            }
-        }
-
-        draw_cube(pixels, rotation);
-
-        if (std::surface_commit(surface, 0, 0, kSurfaceWidth, kSurfaceHeight) == fail) {
-            write_str("[cube] FAIL surface_commit\n");
-            break;
-        }
-
-        std::sleep(kFrameIntervalMs);
-    }
-
-    std::close(events);
-    std::close(window);
-    std::close(surface);
-    std::close(compositor);
-    return 0;
-}
+INSTANT_WINDOW_APP(CubeWindow)
