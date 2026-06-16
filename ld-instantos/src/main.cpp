@@ -419,18 +419,51 @@ Object* loadObjectFromMemory(const char* name, const void* data, u64 size, u64 p
     return object;
 }
 
+// Map a glibc-style component SONAME to the InstantOS runtime that actually
+// provides it. InstantOS ships a single unified userland runtime
+// (libinstant.so) covering the C library and the math/pthread/dl/rt symbols
+// that glibc splits across separate shared objects. Ported binaries (e.g. tcc,
+// whose Makefile hardcodes LIBS=-lm) carry DT_NEEDED entries like "libm.so.6"
+// that have no standalone file here; resolve them to libinstant.so so their
+// symbols are satisfied from the global symbol table. Names we don't recognize
+// pass through unchanged and are looked up as real files under /lib.
+const char* resolveSoname(const char* needed) {
+    struct Alias {
+        const char* from;
+        const char* to;
+    };
+    static const Alias aliases[] = {
+        {"libm.so.6", "libinstant.so"},
+        {"libc.so.6", "libinstant.so"},
+        {"libc.so", "libinstant.so"},
+        {"libpthread.so.0", "libinstant.so"},
+        {"libdl.so.2", "libinstant.so"},
+        {"librt.so.1", "libinstant.so"},
+    };
+    for (const Alias& alias : aliases) {
+        if (cstrEqual(needed, alias.from)) {
+            return alias.to;
+        }
+    }
+    return needed;
+}
+
 Object* loadDependency(const char* needed) {
-    if (Object* existing = findObject(needed)) {
+    // Resolve glibc SONAME aliases before the dedup check so that, e.g.,
+    // "libm.so.6" and an explicit "libinstant.so" in the same DT_NEEDED list
+    // collapse to a single loaded object instead of being loaded twice.
+    const char* resolved = resolveSoname(needed);
+    if (Object* existing = findObject(resolved)) {
         return existing;
     }
 
     char path[128] = {};
     copyString(path, sizeof(path), "/lib/");
-    appendString(path, sizeof(path), needed);
+    appendString(path, sizeof(path), resolved);
 
     u64 size = 0;
     void* data = readWholeFile(path, &size);
-    return loadObjectFromMemory(needed, data, size, nextLibraryBase);
+    return loadObjectFromMemory(resolved, data, size, nextLibraryBase);
 }
 
 u64 lookupSymbol(const char* name, bool* found) {
