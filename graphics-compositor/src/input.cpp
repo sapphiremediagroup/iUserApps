@@ -83,7 +83,9 @@ void clear_drag(DragState* drag) {
     drag->resizing = false;
 }
 
-bool handle_pointer_event(const std::Event& event, DragState* drag, std::uint16_t* buttons, Rect* windowDirty) {
+bool handle_pointer_event(const std::Event& event, const std::WindowInfo* windows, std::uint64_t windowCount,
+                          std::uint32_t screenWidth, std::uint32_t screenHeight,
+                          DragState* drag, std::uint16_t* buttons, Rect* windowDirty) {
     if (event.type != std::EventType::Pointer) {
         return false;
     }
@@ -95,9 +97,7 @@ bool handle_pointer_event(const std::Event& event, DragState* drag, std::uint16_
     const bool leftIsDown = (event.pointer.buttons & 0x1u) != 0;
 
     if (drag->moving && leftIsDown) {
-        std::memset(gWindowsScratch, 0, sizeof(gWindowsScratch));
-        const std::uint64_t count = fetch_windows(gWindowsScratch, kMaxWindows);
-        const std::WindowInfo* before = window_by_id(gWindowsScratch, count, drag->windowId);
+        const std::WindowInfo* before = window_by_id(windows, windowCount, drag->windowId);
         const int newX = event.pointer.x - drag->grabOffsetX;
         const int newY = event.pointer.y - drag->grabOffsetY;
         if (before && std::compositor_move_window(drag->windowId, newX, newY) != fail) {
@@ -108,9 +108,7 @@ bool handle_pointer_event(const std::Event& event, DragState* drag, std::uint16_
             }
         }
     } else if (drag->resizing && leftIsDown) {
-        std::memset(gWindowsScratch, 0, sizeof(gWindowsScratch));
-        const std::uint64_t count = fetch_windows(gWindowsScratch, kMaxWindows);
-        const std::WindowInfo* before = window_by_id(gWindowsScratch, count, drag->windowId);
+        const std::WindowInfo* before = window_by_id(windows, windowCount, drag->windowId);
         int newWidth = drag->startWidth + (event.pointer.x - drag->anchorX);
         int newHeight = drag->startHeight + (event.pointer.y - drag->anchorY);
         if (newWidth < 64) newWidth = 64;
@@ -125,9 +123,7 @@ bool handle_pointer_event(const std::Event& event, DragState* drag, std::uint16_
     }
 
     if (!leftWasDown && leftIsDown) {
-        std::memset(gWindowsScratch, 0, sizeof(gWindowsScratch));
-        const std::uint64_t count = fetch_windows(gWindowsScratch, kMaxWindows);
-        const std::WindowInfo* window = top_window_at(gWindowsScratch, count, event.pointer.x, event.pointer.y);
+        const std::WindowInfo* window = top_window_at(windows, windowCount, event.pointer.x, event.pointer.y);
         if (window) {
             std::compositor_focus_window(window->id);
             fullRedraw = true;
@@ -158,6 +154,15 @@ bool handle_pointer_event(const std::Event& event, DragState* drag, std::uint16_
             if (pointer_on_titlebar(*window, event.pointer.x, event.pointer.y)) {
                 begin_move(drag, *window, event.pointer.x, event.pointer.y);
                 return true;
+            }
+        } else {
+            const int slot = taskbar_center_slot_at(screenWidth, screenHeight, event.pointer.x, event.pointer.y);
+            if (slot >= 0) {
+                if (!launch_taskbar_slot(slot)) {
+                    write_str("[graphics.compositor] FAIL spawn taskbar slot\n");
+                }
+                clear_drag(drag);
+                return false;
             }
         }
     }

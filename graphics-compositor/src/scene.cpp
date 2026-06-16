@@ -14,6 +14,23 @@ Rect taskbar_rect_at(const RenderBuffer& buffer, int index) {
     return { screenWidth - kTaskbarMarginX - kTaskbarWidth, y, kTaskbarWidth, kTaskbarHeight };
 }
 
+int taskbar_center_slot_at(std::uint32_t screenWidth, std::uint32_t screenHeight, int x, int y) {
+    const RenderBuffer probe = { nullptr, screenWidth, screenHeight, screenWidth };
+    const Rect center = taskbar_rect_at(probe, 1);
+    if (!point_in_rect(x, y, center.x, center.y, center.width, center.height)) {
+        return -1;
+    }
+
+    const int slot = ((x - center.x) * kTaskbarCenterSlotCount) / center.width;
+    if (slot < 0) {
+        return 0;
+    }
+    if (slot >= kTaskbarCenterSlotCount) {
+        return kTaskbarCenterSlotCount - 1;
+    }
+    return slot;
+}
+
 void draw_image_scaled(const RenderBuffer& buffer, const ImageAsset& image, int x, int y, int width, int height) {
     if (!image.ready || !image.pixels || width <= 0 || height <= 0) {
         return;
@@ -102,7 +119,8 @@ void draw_taskbar(const RenderBuffer& buffer, const ImageAsset* brandImage, cons
               textColor);
 }
 
-void redraw_scene(const RenderBuffer& buffer, SurfaceCacheEntry* cache, const DesktopBackground* background,
+void redraw_scene(const RenderBuffer& buffer, const std::WindowInfo* windows, std::uint64_t windowCount,
+                  SurfaceCacheEntry* cache, const DesktopBackground* background,
                   const ImageAsset* brandImage, const TaskbarStatusAssets* statusIcons,
                   const WindowControlAssets* controls) {
     const std::uint64_t redrawStart = std::gettime();
@@ -110,18 +128,16 @@ void redraw_scene(const RenderBuffer& buffer, SurfaceCacheEntry* cache, const De
     draw_background(buffer, background);
     add_elapsed(phaseStart, &gTiming.backgroundMs);
 
-    std::memset(gWindowsScratch, 0, sizeof(gWindowsScratch));
-    const std::uint64_t count = fetch_windows(gWindowsScratch, kMaxWindows);
-    for (std::uint64_t i = 0; i < count; ++i) {
-        if (!is_window_visible(gWindowsScratch[i])) {
+    for (std::uint64_t i = 0; i < windowCount; ++i) {
+        if (!is_window_visible(windows[i])) {
             continue;
         }
 
         phaseStart = std::gettime();
-        draw_window_frame(buffer, gWindowsScratch[i], controls);
+        draw_window_frame(buffer, windows[i], controls);
         add_elapsed(phaseStart, &gTiming.windowFrameMs);
         phaseStart = std::gettime();
-        blit_window_surface(buffer, gWindowsScratch[i], find_surface_cache(cache, gWindowsScratch[i].surfaceID));
+        blit_window_surface(buffer, windows[i], find_surface_cache(cache, windows[i].surfaceID));
         add_elapsed(phaseStart, &gTiming.surfaceBlitMs);
     }
 
@@ -129,7 +145,8 @@ void redraw_scene(const RenderBuffer& buffer, SurfaceCacheEntry* cache, const De
     add_elapsed(redrawStart, &gTiming.sceneRedrawMs);
 }
 
-void redraw_scene_rect(const RenderBuffer& buffer, SurfaceCacheEntry* cache, const DesktopBackground* background,
+void redraw_scene_rect(const RenderBuffer& buffer, const std::WindowInfo* windows, std::uint64_t windowCount,
+                       SurfaceCacheEntry* cache, const DesktopBackground* background,
                        const Rect& dirty, const ImageAsset* brandImage, const TaskbarStatusAssets* statusIcons,
                        const WindowControlAssets* controls) {
     const Rect clipped = clamp_rect(dirty, buffer.width, buffer.height);
@@ -144,23 +161,21 @@ void redraw_scene_rect(const RenderBuffer& buffer, SurfaceCacheEntry* cache, con
     gDrawClip = clipped;
     gDrawClipEnabled = true;
 
-    std::memset(gWindowsScratch, 0, sizeof(gWindowsScratch));
-    const std::uint64_t count = fetch_windows(gWindowsScratch, kMaxWindows);
-    for (std::uint64_t i = 0; i < count; ++i) {
-        if (!is_window_visible(gWindowsScratch[i])) {
+    for (std::uint64_t i = 0; i < windowCount; ++i) {
+        if (!is_window_visible(windows[i])) {
             continue;
         }
 
-        const Rect frame = { gWindowsScratch[i].x, gWindowsScratch[i].y,
-            frame_width(gWindowsScratch[i]), frame_height(gWindowsScratch[i]) };
+        const Rect frame = { windows[i].x, windows[i].y,
+            frame_width(windows[i]), frame_height(windows[i]) };
         if (rect_is_empty(intersect_rect(frame, clipped))) {
             continue;
         }
         phaseStart = std::gettime();
-        draw_window_frame(buffer, gWindowsScratch[i], controls);
+        draw_window_frame(buffer, windows[i], controls);
         add_elapsed(phaseStart, &gTiming.windowFrameMs);
         phaseStart = std::gettime();
-        blit_window_surface(buffer, gWindowsScratch[i], find_surface_cache(cache, gWindowsScratch[i].surfaceID));
+        blit_window_surface(buffer, windows[i], find_surface_cache(cache, windows[i].surfaceID));
         add_elapsed(phaseStart, &gTiming.surfaceBlitMs);
     }
 

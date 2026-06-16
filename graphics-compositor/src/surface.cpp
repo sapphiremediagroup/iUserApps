@@ -348,13 +348,12 @@ std::uint64_t fetch_windows(std::WindowInfo* windows, std::uint64_t capacity) {
     return count;
 }
 
-Rect consume_surface_dirty_rect(SurfaceCacheEntry* cache, std::uint32_t width, std::uint32_t height) {
+Rect consume_surface_dirty_rect(const std::WindowInfo* windows, std::uint64_t windowCount,
+                                SurfaceCacheEntry* cache, std::uint32_t width, std::uint32_t height) {
     Rect dirty = { 0, 0, 0, 0 };
-    std::memset(gWindowsScratch, 0, sizeof(gWindowsScratch));
-    const std::uint64_t count = fetch_windows(gWindowsScratch, kMaxWindows);
 
-    for (std::uint64_t i = 0; i < count; ++i) {
-        const std::WindowInfo& window = gWindowsScratch[i];
+    for (std::uint64_t i = 0; i < windowCount; ++i) {
+        const std::WindowInfo& window = windows[i];
         if (!is_window_visible(window)) {
             continue;
         }

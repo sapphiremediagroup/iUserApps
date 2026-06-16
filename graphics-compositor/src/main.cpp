@@ -135,8 +135,8 @@ private:
 
     void renderInitialScene() {
         sceneBuffer = &buffers.acquire();
-        redraw_scene(*sceneBuffer, gSurfaceCache, &background, &taskbarBrand, &taskbarStatus, &windowControls);
         updateWindowSnapshot();
+        redraw_scene(*sceneBuffer, windowSnapshot, windowSnapshotCount, gSurfaceCache, &background, &taskbarBrand, &taskbarStatus, &windowControls);
         present_to_framebuffer(*sceneBuffer, framebuffer);
         present_cursor_move(*sceneBuffer, framebuffer, cursor, cursor, cursorImage);
         ++gTiming.frames;
@@ -170,7 +170,7 @@ private:
             }
 
             if (surfaceDirty) {
-                const Rect dirty = consume_surface_dirty_rect(gSurfaceCache, fbInfo.width, fbInfo.height);
+                const Rect dirty = consume_surface_dirty_rect(windowSnapshot, windowSnapshotCount, gSurfaceCache, fbInfo.width, fbInfo.height);
                 windowDirty = union_rect(windowDirty, dirty);
             }
 
@@ -261,7 +261,7 @@ private:
     void handlePointerEventMessage(const std::Event& event, bool* fullSceneDirty, Rect* windowDirty) {
         const CursorState previousCursor = cursor;
         move_cursor(framebuffer, &cursor, event.pointer.x, event.pointer.y);
-        if (handle_pointer_event(event, &drag, &pointerButtons, windowDirty)) {
+        if (handle_pointer_event(event, windowSnapshot, windowSnapshotCount, fbInfo.width, fbInfo.height, &drag, &pointerButtons, windowDirty)) {
             *fullSceneDirty = true;
         } else if (!*fullSceneDirty && (!windowDirty || rect_is_empty(*windowDirty)) &&
                    (previousCursor.x != cursor.x || previousCursor.y != cursor.y)) {
@@ -335,8 +335,8 @@ private:
 
     void redrawFullScene() {
         sceneBuffer = &buffers.acquire();
-        redraw_scene(*sceneBuffer, gSurfaceCache, &background, &taskbarBrand, &taskbarStatus, &windowControls);
         updateWindowSnapshot();
+        redraw_scene(*sceneBuffer, windowSnapshot, windowSnapshotCount, gSurfaceCache, &background, &taskbarBrand, &taskbarStatus, &windowControls);
         clear_surface_dirty_flags(gSurfaceCache);
         present_to_framebuffer(*sceneBuffer, framebuffer);
         present_cursor_move(*sceneBuffer, framebuffer, cursor, cursor, cursorImage);
@@ -350,7 +350,7 @@ private:
             return;
         }
 
-        redraw_scene_rect(*sceneBuffer, gSurfaceCache, &background, windowDirty, &taskbarBrand, &taskbarStatus, &windowControls);
+        redraw_scene_rect(*sceneBuffer, windowSnapshot, windowSnapshotCount, gSurfaceCache, &background, windowDirty, &taskbarBrand, &taskbarStatus, &windowControls);
         present_rect_to_framebuffer(*sceneBuffer, framebuffer, windowDirty);
         present_cursor_move(*sceneBuffer, framebuffer, cursor, cursor, cursorImage);
         ++gTiming.frames;

@@ -47,6 +47,7 @@ constexpr int kControlIconSize = 10;
 constexpr int kResizeGripSize = 14;
 constexpr int kTaskbarWidth = 230;
 constexpr int kTaskbarCenterWidth = 378;
+constexpr int kTaskbarCenterSlotCount = 4;
 constexpr int kTaskbarHeight = 66;
 constexpr int kTaskbarMarginX = 30;
 constexpr int kTaskbarBottomMargin = 25;
@@ -323,7 +324,7 @@ SurfaceCacheEntry* find_surface_cache(SurfaceCacheEntry* cache, std::uint64_t su
 void remember_surface(SurfaceCacheEntry* cache, const std::SurfaceInfo& info);
 bool pump_surface_updates(SurfaceCacheEntry* cache);
 std::uint64_t fetch_windows(std::WindowInfo* windows, std::uint64_t capacity);
-Rect consume_surface_dirty_rect(SurfaceCacheEntry* cache, std::uint32_t width, std::uint32_t height);
+Rect consume_surface_dirty_rect(const std::WindowInfo* windows, std::uint64_t windowCount, SurfaceCacheEntry* cache, std::uint32_t width, std::uint32_t height);
 void clear_surface_dirty_flags(SurfaceCacheEntry* cache);
 
 int window_control_slot_from_left(int control);
@@ -334,10 +335,12 @@ void draw_window_frame(const RenderBuffer& buffer, const std::WindowInfo& window
 void blit_window_surface(const RenderBuffer& buffer, const std::WindowInfo& window, const SurfaceCacheEntry* surfaceEntry);
 
 Rect taskbar_rect_at(const RenderBuffer& buffer, int index);
+int taskbar_center_slot_at(std::uint32_t screenWidth, std::uint32_t screenHeight, int x, int y);
+bool launch_taskbar_slot(int slot);
 void draw_image_scaled(const RenderBuffer& buffer, const ImageAsset& image, int x, int y, int width, int height);
 void draw_taskbar(const RenderBuffer& buffer, const ImageAsset* brandImage, const TaskbarStatusAssets* statusIcons);
-void redraw_scene(const RenderBuffer& buffer, SurfaceCacheEntry* cache, const DesktopBackground* background, const ImageAsset* brandImage, const TaskbarStatusAssets* statusIcons, const WindowControlAssets* controls);
-void redraw_scene_rect(const RenderBuffer& buffer, SurfaceCacheEntry* cache, const DesktopBackground* background, const Rect& dirty, const ImageAsset* brandImage, const TaskbarStatusAssets* statusIcons, const WindowControlAssets* controls);
+void redraw_scene(const RenderBuffer& buffer, const std::WindowInfo* windows, std::uint64_t windowCount, SurfaceCacheEntry* cache, const DesktopBackground* background, const ImageAsset* brandImage, const TaskbarStatusAssets* statusIcons, const WindowControlAssets* controls);
+void redraw_scene_rect(const RenderBuffer& buffer, const std::WindowInfo* windows, std::uint64_t windowCount, SurfaceCacheEntry* cache, const DesktopBackground* background, const Rect& dirty, const ImageAsset* brandImage, const TaskbarStatusAssets* statusIcons, const WindowControlAssets* controls);
 
 const std::WindowInfo* top_window_at(const std::WindowInfo* windows, std::uint64_t count, int x, int y);
 const std::WindowInfo* window_by_id(const std::WindowInfo* windows, std::uint64_t count, std::uint64_t id);
@@ -350,4 +353,4 @@ bool pointer_on_titlebar(const std::WindowInfo& window, int x, int y);
 void begin_move(DragState* drag, const std::WindowInfo& window, int pointerX, int pointerY);
 void begin_resize(DragState* drag, const std::WindowInfo& window, int pointerX, int pointerY);
 void clear_drag(DragState* drag);
-bool handle_pointer_event(const std::Event& event, DragState* drag, std::uint16_t* buttons, Rect* windowDirty);
+bool handle_pointer_event(const std::Event& event, const std::WindowInfo* windows, std::uint64_t windowCount, std::uint32_t screenWidth, std::uint32_t screenHeight, DragState* drag, std::uint16_t* buttons, Rect* windowDirty);

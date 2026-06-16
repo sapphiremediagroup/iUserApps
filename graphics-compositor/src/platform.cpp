@@ -67,6 +67,21 @@ bool launch_terminal() {
     return std::spawn("/bin/terminal") != fail;
 }
 
+bool launch_taskbar_slot(int slot) {
+    switch (slot) {
+        case 0:
+            return launch_terminal();
+        case 1:
+            return launch_file_browser();
+        case 2:
+            return launch_background_switcher();
+        case 3:
+            return launch_cube();
+        default:
+            return false;
+    }
+}
+
 bool decode_event_message(const std::IPCMessage& message, std::Event* event) {
     return std::event_from_message(message, event);
 }
