@@ -20,6 +20,23 @@
 #include <poll.h>
 #include <sys/utsname.h>
 
+// Terminal ioctl request numbers (match the kernel PTY_TC* constants in
+// include/cpu/tty/pty.hpp, i.e. the Linux values). The linux abi-bits ioctls.h
+// used by this sysdeps build supplies TIOCGWINSZ but not the TCGETS family;
+// recovered here from the transcript (lost sysdeps.cpp region).
+#ifndef TCGETS
+#define TCGETS  0x5401
+#endif
+#ifndef TCSETS
+#define TCSETS  0x5402
+#endif
+#ifndef TCSETSW
+#define TCSETSW 0x5403
+#endif
+#ifndef TCSETSF
+#define TCSETSF 0x5404
+#endif
+
 // Kernel KernelStatfs layout (struct KernelStatfs in the kernel).
 struct instantos_statfs {
     unsigned long blockSize;
@@ -1248,10 +1265,9 @@ void fill_statvfs(const instantos_statfs& ks, struct statvfs* out) {
     out->f_files = ks.totalInodes;
     out->f_ffree = ks.freeInodes;
     out->f_favail = ks.freeInodes;
-    out->f_fsid = 0;
+    out->f_fsid = ks.fsType;
     out->f_flag = 0;
     out->f_namemax = ks.nameMax;
-    out->f_type = ks.fsType;
 }
 }  // namespace
 

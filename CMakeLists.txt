@@ -76,7 +76,14 @@ set(USER_LINK_OPTIONS
 
 function(add_user_app target_name)
     file(GLOB app_sources CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp")
-    add_executable(${target_name} ${app_sources} $<TARGET_OBJECTS:instant_crt0>)
+    add_user_app_sources(${target_name} ${app_sources})
+endfunction()
+
+# Recovered from the transcript reads sidecar: the lost commit split the body of
+# add_user_app into this helper so callers (e.g. posix-smoke) can build several
+# targets from an explicit source list rather than a src/*.cpp glob.
+function(add_user_app_sources target_name)
+    add_executable(${target_name} ${ARGN} $<TARGET_OBJECTS:instant_crt0>)
     target_compile_options(${target_name} PRIVATE ${USER_CXX_FLAGS} ${SIZE_CXX_FLAGS})
     target_link_libraries(${target_name} PRIVATE ilibcxx::ilibcxx)
     target_link_options(${target_name} PRIVATE
