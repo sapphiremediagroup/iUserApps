@@ -1,12 +1,20 @@
 add_executable(ld-instantos src/main.cpp)
 
+# ld-instantos needs the repo-root kernel headers (common/elf.hpp). In the
+# in-tree (clang) build CMAKE_SOURCE_DIR is the repo root; when iUserApps is
+# configured standalone (the GCC userland build) the caller passes the path via
+# -DINSTANTOS_KERNEL_INCLUDE.
+if(NOT DEFINED INSTANTOS_KERNEL_INCLUDE)
+    set(INSTANTOS_KERNEL_INCLUDE ${CMAKE_SOURCE_DIR}/include)
+endif()
+
 target_include_directories(ld-instantos PRIVATE
-    ${CMAKE_SOURCE_DIR}/include
+    ${INSTANTOS_KERNEL_INCLUDE}
 )
 
 target_compile_options(ld-instantos PRIVATE
     ${USER_BASE_CXX_FLAGS}
-    -target x86_64-unknown-elf
+    ${USER_TARGET_FLAGS}
     -fno-pic
     -mcmodel=large
     -ffreestanding
@@ -21,7 +29,7 @@ target_link_options(ld-instantos PRIVATE
     --gc-sections
     --build-id=none
     "SHELL:-z max-page-size=0x1000"
-    --image-base=0x0000500000000000
+    ${INSTANTOS_LOADER_BASE_FLAG}
     -e
     _start
 )

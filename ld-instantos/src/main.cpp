@@ -466,9 +466,12 @@ Object* loadDependency(const char* needed) {
     return loadObjectFromMemory(resolved, data, size, nextLibraryBase);
 }
 
-u64 lookupSymbol(const char* name, bool* found) {
+u64 lookupSymbolExcluding(const char* name, const Object* exclude, bool* found) {
     for (u32 objIndex = 0; objIndex < objectCount; objIndex++) {
         Object& object = objects[objIndex];
+        if (&object == exclude) {
+            continue;
+        }
         if (!object.symtab || !object.strtab) {
             continue;
         }
@@ -487,6 +490,10 @@ u64 lookupSymbol(const char* name, bool* found) {
 
     *found = false;
     return 0;
+}
+
+u64 lookupSymbol(const char* name, bool* found) {
+    return lookupSymbolExcluding(name, nullptr, found);
 }
 
 void applyRelocation(Object& object, const Elf::Rela64& rela) {
@@ -514,14 +521,49 @@ void applyRelocation(Object& object, const Elf::Rela64& rela) {
                 if (Elf::symbolBinding(sym.info) == 2) {
                     value = 0;
                 } else {
+                    writeText("[ld-instantos] unresolved symbol: ");
+                    writeText(name);
+                    writeText("\n");
                     fatal("unresolved symbol");
                 }
             }
             *target = value + static_cast<u64>(rela.addend);
             return;
         }
-        default:
+        case Elf::RelocationX86_64Copy: {
+            // Copy relocation: a data object (e.g. stdout/stderr, size 8 FILE*)
+            // is imported by the executable, which reserved a slot in its own
+            // .bss. Copy the defining library's initial bytes into that slot;
+            // the lookup must skip this object so it finds the library's copy,
+            // not the executable's just-reserved (empty) one.
+            if (!object.symtab || symbolIndex >= object.symbolCount) {
+                fatal("bad symbol relocation");
+            }
+            Elf::Symbol64& sym = object.symtab[symbolIndex];
+            const char* name = object.strtab + sym.name;
+            bool found = false;
+            u64 source = lookupSymbolExcluding(name, &object, &found);
+            if (!found) {
+                fatal("unresolved copy symbol");
+            }
+            copyBytes(reinterpret_cast<void*>(target),
+                      reinterpret_cast<const void*>(source), sym.size);
+            return;
+        }
+        default: {
+            writeText("[ld-instantos] unsupported relocation type=");
+            char buffer[19];
+            buffer[0] = '0';
+            buffer[1] = 'x';
+            for (int i = 0; i < 16; i++) {
+                unsigned nibble = (type >> ((15 - i) * 4)) & 0xf;
+                buffer[2 + i] = static_cast<char>(nibble < 10 ? '0' + nibble : 'a' + nibble - 10);
+            }
+            buffer[18] = '\0';
+            writeText(buffer);
+            writeText("\n");
             fatal("unsupported relocation");
+        }
     }
 }
 

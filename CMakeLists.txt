@@ -9,8 +9,44 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_LINK_DEPENDS_USE_LINKER FALSE)
 set(CMAKE_SKIP_RPATH TRUE)
 
-set(CMAKE_CXX_LINK_EXECUTABLE "ld.lld <LINK_FLAGS> <OBJECTS> -o <TARGET> <LINK_LIBRARIES>")
-set(CMAKE_CXX_CREATE_SHARED_LIBRARY "ld.lld -shared <LINK_FLAGS> <OBJECTS> -o <TARGET> <LINK_LIBRARIES>")
+# --- Userland toolchain selection (P5.5 Stage 4b) -------------------------
+# Default: clang cross (-target x86_64-unknown-elf) linking with ld.lld.
+# INSTANTOS_USERLAND_GCC=ON builds the libinstant userland with the GCC cross
+# (CMAKE_CXX_COMPILER=x86_64-unknown-instantos-g++, set by a toolchain file)
+# linking with GNU ld (INSTANTOS_GCC_LD). GCC is already the instantos target so
+# it needs no -target, and it uses -Os rather than clang's -Oz.
+option(INSTANTOS_USERLAND_GCC "Build the libinstant userland with the GCC cross toolchain" OFF)
+if(INSTANTOS_USERLAND_GCC)
+    set(USER_TARGET_FLAGS "")
+    if(NOT INSTANTOS_GCC_LD)
+        set(INSTANTOS_GCC_LD x86_64-unknown-instantos-ld)
+    endif()
+    set(_USER_LD "${INSTANTOS_GCC_LD}")
+    set(_USER_SIZE_OPT -Os)
+    # GNU ld places the fixed-address loader with -Ttext-segment (lld uses
+    # --image-base for the same effect).
+    set(INSTANTOS_LOADER_BASE_FLAG -Ttext-segment=0x0000500000000000)
+    # Standalone build: emit binaries into out/ so executables (e.g.
+    # input-manager) do not collide with the per-target build subdirs that sit
+    # directly under CMAKE_BINARY_DIR.
+    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/out)
+    set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/out)
+    set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/out)
+else()
+    set(USER_TARGET_FLAGS -target x86_64-unknown-elf)
+    set(_USER_LD ld.lld)
+    set(_USER_SIZE_OPT -Oz)
+    set(INSTANTOS_LOADER_BASE_FLAG --image-base=0x0000500000000000)
+endif()
+
+set(CMAKE_CXX_LINK_EXECUTABLE "${_USER_LD} <LINK_FLAGS> <OBJECTS> -o <TARGET> <LINK_LIBRARIES>")
+set(CMAKE_CXX_CREATE_SHARED_LIBRARY "${_USER_LD} -shared <LINK_FLAGS> <OBJECTS> -o <TARGET> <LINK_LIBRARIES>")
+
+# SIZE_CXX_FLAGS is normally injected by the parent (kernel) CMakeLists; when
+# iUserApps is configured standalone (the GCC userland build) provide it here.
+if(NOT DEFINED SIZE_CXX_FLAGS)
+    set(SIZE_CXX_FLAGS ${_USER_SIZE_OPT} -ffunction-sections -fdata-sections -fomit-frame-pointer)
+endif()
 
 set(USER_BASE_CXX_FLAGS
     -fno-rtti
@@ -27,7 +63,7 @@ set(USER_BASE_CXX_FLAGS
 
 set(USER_CXX_FLAGS
     ${USER_BASE_CXX_FLAGS}
-    -target x86_64-unknown-elf
+    ${USER_TARGET_FLAGS}
     -fPIC
 )
 
@@ -86,5 +122,11 @@ add_subdirectory(background-switcher)
 add_subdirectory(file-browser)
 add_subdirectory(terminal)
 add_subdirectory(cube)
-add_subdirectory(posix-smoke)
-add_subdirectory(net-smoke)
+# posix-smoke / net-smoke are conformance test apps (not runtime substrate and
+# not shipped in the os-testsuite ISO). posix-smoke uses a few declarations
+# (mkfifo/EWOULDBLOCK) that the clang header set exposes but GCC's does not, so
+# skip them in the GCC userland build.
+if(NOT INSTANTOS_USERLAND_GCC)
+    add_subdirectory(posix-smoke)
+    add_subdirectory(net-smoke)
+endif()

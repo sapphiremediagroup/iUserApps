@@ -68,12 +68,43 @@ struct instantos_winsize {
     unsigned short ws_ypixel;
 };
 
+// Argument block for the file-backed mmap syscall (SyscallNumber::MmapFile).
+// Passed by pointer because six 64-bit words exceed the 5-argument syscall
+// convention. Field order must match struct MmapFileArgs in the kernel.
+struct instantos_mmap_file_args {
+    unsigned long addr;
+    unsigned long length;
+    unsigned long prot;
+    unsigned long flags;
+    unsigned long fd;
+    unsigned long offset;
+};
+
 extern "C" long __do_syscall0(long);
 extern "C" long __do_syscall1(long, long);
 extern "C" long __do_syscall2(long, long, long);
 extern "C" long __do_syscall3(long, long, long, long);
 extern "C" long __do_syscall4(long, long, long, long, long);
 extern "C" long __do_syscall5(long, long, long, long, long, long);
+
+// Signal-return trampoline. mlibc does not supply an sa_restorer, so the kernel
+// would otherwise have a signal handler "return" to a garbage/uninitialised
+// address. This stub is installed as the restorer for every sigaction: when a
+// handler returns, control lands here and issues SYS_SigReturn (21), which
+// restores the pre-signal register context and unblocks the signal. Defined in
+// assembly so it has no prologue/return of its own.
+asm(
+    ".pushsection .text\n"
+    ".globl __instantos_sigrestorer\n"
+    ".hidden __instantos_sigrestorer\n"
+    ".type __instantos_sigrestorer, @function\n"
+    ".align 16\n"
+    "__instantos_sigrestorer:\n"
+    "    movl $21, %eax\n"   // SyscallNumber::SigReturn
+    "    syscall\n"
+    ".popsection\n"
+);
+extern "C" void __instantos_sigrestorer();
 
 namespace {
 constexpr int kMaxFd = 256;
@@ -110,6 +141,36 @@ int register_fd_at(int fd, long handle) {
     }
     fdTable[fd] = handle;
     return fd;
+}
+
+// AT_FDCWD: "resolve relative to the current working directory" (Linux ABI).
+constexpr int kAtFdCwd = -100;
+
+// Resolve the path a *at call should operate on. When `path` is absolute or the
+// directory fd is AT_FDCWD, the original path is used unchanged. Otherwise the
+// directory fd's absolute path (from the kernel fd->path syscall) is prefixed,
+// composing "<dir>/<path>" into `out`. Returns the string to use (either `path`
+// itself or `out`), or nullptr on failure with *err set to an errno value.
+const char* at_resolve(int dirfd, const char* path, char* out, size_t outsz, int* err) {
+    *err = 0;
+    if (!path) { *err = EINVAL; return nullptr; }
+    if (path[0] == '/' || dirfd == kAtFdCwd) {
+        return path;   // absolute, or already cwd-relative
+    }
+    long handle = handle_for_fd(dirfd);
+    if (handle < 0) { *err = EBADF; return nullptr; }
+    char dir[256];
+    long n = __do_syscall3(INSTANTOS_SYS_FD_PATH, handle,
+                           reinterpret_cast<long>(dir), static_cast<long>(sizeof(dir)));
+    if (int e = sc_error(n); e) { *err = e; return nullptr; }
+    size_t di = 0;
+    for (long i = 0; i < n && di + 1 < outsz; ++i) out[di++] = dir[i];
+    if (di == 0 || out[di - 1] != '/') {
+        if (di + 1 < outsz) out[di++] = '/';
+    }
+    for (size_t pi = 0; path[pi] != '\0' && di + 1 < outsz; ++pi) out[di++] = path[pi];
+    out[di] = '\0';
+    return out;
 }
 
 // --- Directory streams ---------------------------------------------------
@@ -149,6 +210,8 @@ constexpr int kDirHandleBase = 0x40000000;
 struct DirStream {
     bool inUse = false;
     bool loaded = false;
+    bool fromFd = false;   // opened via fdopendir(): keyed by a real fd, not a high handle
+    int ownerFd = 0;       // the owning real fd when fromFd (freed by close(ownerFd))
     int cursor = 0;
     int count = 0;
     char path[256];
@@ -164,6 +227,8 @@ int alloc_dir_stream(const char* path) {
         if (!dirStreams[i].inUse) {
             dirStreams[i].inUse = true;
             dirStreams[i].loaded = false;
+            dirStreams[i].fromFd = false;
+            dirStreams[i].ownerFd = 0;
             dirStreams[i].cursor = 0;
             dirStreams[i].count = 0;
             size_t j = 0;
@@ -175,6 +240,29 @@ int alloc_dir_stream(const char* path) {
         }
     }
     return -1;
+}
+
+// Find the directory snapshot owned by a real fd (fdopendir), or -1.
+int find_dir_stream_by_fd(int fd) {
+    for (int i = 0; i < kMaxDirs; ++i) {
+        if (dirStreams[i].inUse && dirStreams[i].fromFd && dirStreams[i].ownerFd == fd) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+// Resolve an open fd to its absolute path via the kernel fd->path syscall.
+const char* fd_to_path(int fd, char* out, size_t outsz, int* err) {
+    *err = 0;
+    long h = handle_for_fd(fd);
+    if (h < 0) { *err = EBADF; return nullptr; }
+    long n = __do_syscall3(INSTANTOS_SYS_FD_PATH, h,
+                           reinterpret_cast<long>(out), static_cast<long>(outsz));
+    if (int e = sc_error(n); e) { *err = e; return nullptr; }
+    if (n <= 0 || static_cast<size_t>(n) >= outsz) { *err = EINVAL; return nullptr; }
+    out[n] = '\0';
+    return out;
 }
 
 unsigned char dt_from_filetype(unsigned int type) {
@@ -190,6 +278,15 @@ unsigned char dt_from_filetype(unsigned int type) {
     }
 }
 
+}
+
+// P3.2: restore the libc fd-number -> handle table that Execve stashed before an
+// exec, so inherited fds (>2) survive the image replacement. Called once from
+// __mlibc_entry at process start; the kernel returns nothing for a process that
+// never stashed (initial process / fork child that didn't exec), leaving the
+// default {0,1,2} table intact.
+extern "C" void __instantos_restore_fdtable(void) {
+    __do_syscall2(INSTANTOS_SYS_FDTABLE_FETCH, reinterpret_cast<long>(fdTable), kMaxFd);
 }
 
 namespace mlibc {
@@ -260,6 +357,14 @@ int Sysdeps<Close>::operator()(int fd) {
         dirStreams[slot].loaded = false;
         return 0;
     }
+    // A real fd may also own an fdopendir() directory snapshot (see ReadEntries);
+    // release it here so closedir(fdopendir(fd)) does not leak a DirStream slot.
+    int dslot = find_dir_stream_by_fd(fd);
+    if (dslot >= 0) {
+        dirStreams[dslot].inUse = false;
+        dirStreams[dslot].loaded = false;
+        dirStreams[dslot].fromFd = false;
+    }
     long handle = handle_for_fd(fd);
     if (handle < 0) return EBADF;
     // The standard streams (fd 0/1/2) are backed by the console or an inherited
@@ -303,9 +408,30 @@ int Sysdeps<OpenDir>::operator()(const char* path, int* handle) {
 }
 
 int Sysdeps<ReadEntries>::operator()(int handle, void* buffer, size_t max_size, size_t* bytes_read) {
-    int slot = handle - kDirHandleBase;
-    if (slot < 0 || slot >= kMaxDirs || !dirStreams[slot].inUse) return EBADF;
     if (!buffer || !bytes_read) return EINVAL;
+
+    int slot;
+    if (handle >= kDirHandleBase) {
+        // opendir(path): high handle indexes the DirStream table directly.
+        slot = handle - kDirHandleBase;
+        if (slot < 0 || slot >= kMaxDirs || !dirStreams[slot].inUse) return EBADF;
+    } else {
+        // fdopendir(fd): mlibc stored a real fd in DIR::__handle. Directory
+        // iteration is path-based here, so recover the fd's path (fd->path
+        // syscall) once and drive the same snapshot machinery, keyed to the fd
+        // so the snapshot persists across readdir() calls and is released by
+        // close(fd). The fd itself stays open, so dirfd()+openat() keep working.
+        slot = find_dir_stream_by_fd(handle);
+        if (slot < 0) {
+            char pbuf[256]; int e;
+            const char* p = fd_to_path(handle, pbuf, sizeof(pbuf), &e);
+            if (!p) return e;
+            slot = alloc_dir_stream(p);
+            if (slot < 0) return EMFILE;
+            dirStreams[slot].fromFd = true;
+            dirStreams[slot].ownerFd = handle;
+        }
+    }
 
     DirStream& dir = dirStreams[slot];
 
@@ -372,18 +498,33 @@ int Sysdeps<Mkdir>::operator()(const char* path, mode_t mode) {
     return sc_error(ret);
 }
 
+int Sysdeps<Mkdirat>::operator()(int dirfd, const char* path, mode_t mode) {
+    // Resolve `path` against the directory fd, then create via the path-based
+    // mkdir syscall. GNU tar/coreutils create extracted directories with
+    // mkdirat(chdir_fd, name, mode).
+    char buf[512]; int e;
+    const char* p = at_resolve(dirfd, path, buf, sizeof(buf), &e);
+    if (!p) return e;
+    long ret = __do_syscall2(INSTANTOS_SYS_MKDIR, reinterpret_cast<long>(p),
+                             static_cast<long>(mode));
+    return sc_error(ret);
+}
+
 int Sysdeps<Rmdir>::operator()(const char* path) {
     long ret = __do_syscall1(INSTANTOS_SYS_RMDIR, reinterpret_cast<long>(path));
     return sc_error(ret);
 }
 
-int Sysdeps<Unlinkat>::operator()(int /*dirfd*/, const char* path, int flags) {
+int Sysdeps<Unlinkat>::operator()(int dirfd, const char* path, int flags) {
+    char buf[512]; int e;
+    const char* p = at_resolve(dirfd, path, buf, sizeof(buf), &e);
+    if (!p) return e;
     // AT_REMOVEDIR (0x200) selects rmdir semantics; otherwise unlink a file.
     if (flags & 0x200) {
-        long ret = __do_syscall1(INSTANTOS_SYS_RMDIR, reinterpret_cast<long>(path));
+        long ret = __do_syscall1(INSTANTOS_SYS_RMDIR, reinterpret_cast<long>(p));
         return sc_error(ret);
     }
-    long ret = __do_syscall1(INSTANTOS_SYS_UNLINK, reinterpret_cast<long>(path));
+    long ret = __do_syscall1(INSTANTOS_SYS_UNLINK, reinterpret_cast<long>(p));
     return sc_error(ret);
 }
 
@@ -557,12 +698,16 @@ int Sysdeps<Stat>::operator()(fsfd_target fsfdt, int fd, const char* path, int f
             ret = __do_syscall2(INSTANTOS_SYS_FSTAT, handle, reinterpret_cast<long>(&ks));
             break;
         }
-        case fsfd_target::fd_path:
-            // Only AT_FDCWD-relative paths are supported; ignore the (cwd) fd.
+        case fsfd_target::fd_path: {
+            // fstatat(dirfd, path): resolve path against the directory fd.
+            char buf[512]; int e;
+            const char* p = at_resolve(fd, path, buf, sizeof(buf), &e);
+            if (!p) return e;
             ret = __do_syscall2((flags & AT_SYMLINK_NOFOLLOW) ? INSTANTOS_SYS_LSTAT
                                                               : INSTANTOS_SYS_STAT,
-                                reinterpret_cast<long>(path), reinterpret_cast<long>(&ks));
+                                reinterpret_cast<long>(p), reinterpret_cast<long>(&ks));
             break;
+        }
         default:
             return EINVAL;
     }
@@ -639,8 +784,30 @@ int Sysdeps<AnonFree>::operator()(void* pointer, size_t size) {
     return sysdep<VmUnmap>(pointer, size);
 }
 
-int Sysdeps<VmMap>::operator()(void* hint, size_t size, int prot, int, int, off_t, void** window) {
-    long ret = __do_syscall3(INSTANTOS_SYS_MMAP, reinterpret_cast<long>(hint), static_cast<long>(size), prot);
+int Sysdeps<VmMap>::operator()(void* hint, size_t size, int prot, int flags, int fd, off_t offset, void** window) {
+    // Anonymous mappings (including AnonAllocate) use the plain demand-paged
+    // mmap that ignores fd/offset.
+    if ((flags & MAP_ANONYMOUS) || fd < 0) {
+        long ret = __do_syscall3(INSTANTOS_SYS_MMAP, reinterpret_cast<long>(hint),
+                                 static_cast<long>(size), prot);
+        if (int e = sc_error(ret); e) return e;
+        *window = reinterpret_cast<void*>(ret);
+        return 0;
+    }
+
+    // File-backed mapping: translate the userspace fd to its kernel handle and
+    // hand the kernel the full argument set via a struct (six values exceed the
+    // 5-argument syscall convention).
+    long handle = handle_for_fd(fd);
+    if (handle < 0) return EBADF;
+    struct instantos_mmap_file_args args;
+    args.addr = reinterpret_cast<unsigned long>(hint);
+    args.length = static_cast<unsigned long>(size);
+    args.prot = static_cast<unsigned long>(prot);
+    args.flags = static_cast<unsigned long>(flags);
+    args.fd = static_cast<unsigned long>(handle);
+    args.offset = static_cast<unsigned long>(offset);
+    long ret = __do_syscall1(INSTANTOS_SYS_MMAP_FILE, reinterpret_cast<long>(&args));
     if (int e = sc_error(ret); e) return e;
     *window = reinterpret_cast<void*>(ret);
     return 0;
@@ -654,6 +821,15 @@ int Sysdeps<VmUnmap>::operator()(void* pointer, size_t size) {
 int Sysdeps<VmProtect>::operator()(void* pointer, size_t size, int prot) {
     long ret = __do_syscall3(INSTANTOS_SYS_MPROTECT, reinterpret_cast<long>(pointer),
                              static_cast<long>(size), prot);
+    return sc_error(ret);
+}
+
+int Sysdeps<Msync>::operator()(void* pointer, size_t size, int flags) {
+    // Flush a MAP_SHARED file mapping's dirty pages to its backing file. The
+    // kernel always syncs synchronously; MS_SYNC/MS_ASYNC/MS_INVALIDATE are
+    // accepted and ignored beyond that.
+    long ret = __do_syscall3(INSTANTOS_SYS_MSYNC, reinterpret_cast<long>(pointer),
+                             static_cast<long>(size), static_cast<long>(flags));
     return sc_error(ret);
 }
 
@@ -711,6 +887,77 @@ int Sysdeps<FutexWake>::operator()(int*, bool) {
     return 0;
 }
 
+// --- Threads -------------------------------------------------------------
+//
+// mlibc's generic pthread layer drives thread creation through three sysdeps:
+// PrepareStack lays out a fresh stack, Clone spawns the kernel thread on it,
+// and ThreadExit terminates the calling thread. Joining is done entirely in
+// userspace by mlibc (a futex spin on the TCB's didExit flag), so the kernel
+// side is deliberately handle-free. See sys_thread_clone() in the kernel.
+//
+// This block is excluded from the runtime linker (ld-instantos.so), which is
+// single-threaded and does not link the pthread machinery (mlibc::thread_exit
+// lives in libc.so only).
+#ifndef MLIBC_BUILDING_RTLD
+
+// Assembly entry stub for a newly spawned thread (defined below, outside the
+// namespace so it keeps C linkage / a plain global symbol).
+extern "C" void __mlibc_thread_entry();
+
+// Matches mlibc's default pthread stack (see thread_attr_init()).
+static constexpr size_t kDefaultThreadStack = 0x200000;
+
+int Sysdeps<PrepareStack>::operator()(void** stack, void* entry, void* user_arg, void* tcb,
+                                      size_t* stack_size, size_t* guard_size, void** stack_base) {
+    // We do not install a guard page yet; mlibc tolerates guard_size == 0.
+    *guard_size = 0;
+    if (!*stack_size)
+        *stack_size = kDefaultThreadStack;
+
+    if (*stack) {
+        // Caller-provided stack (pthread_attr_setstack): use it as-is.
+        *stack_base = *stack;
+    } else {
+        void* base = nullptr;
+        if (int e = sysdep<AnonAllocate>(*stack_size, &base); e)
+            return e;
+        *stack_base = base;
+    }
+
+    // Lay the mlibc thread-entry arguments at the top of the stack. The stub
+    // __mlibc_thread_entry pops them in this order: entry, tcb, user_arg, and a
+    // final nul filler that leaves rsp 16-byte aligned before it calls the C
+    // trampoline. The base is page-aligned and the size is a multiple of 16, so
+    // the initial sp (top - 32) is 16-aligned as the SysV ABI requires.
+    auto* sp = reinterpret_cast<void**>(reinterpret_cast<char*>(*stack_base) + *stack_size);
+    *--sp = nullptr;     // alignment filler
+    *--sp = user_arg;
+    *--sp = tcb;
+    *--sp = entry;
+    *stack = reinterpret_cast<void*>(sp);
+    return 0;
+}
+
+int Sysdeps<Clone>::operator()(void* tcb, pid_t* pid_out, void* stack) {
+    // The new thread installs its own TLS (fs base = tcb) from the trampoline
+    // via TcbSet, so the kernel does not need the tcb here.
+    (void)tcb;
+    long ret = __do_syscall2(INSTANTOS_SYS_THREAD_CLONE,
+                             reinterpret_cast<long>(&__mlibc_thread_entry),
+                             reinterpret_cast<long>(stack));
+    if (int e = sc_error(ret); e)
+        return e;
+    *pid_out = static_cast<pid_t>(ret);
+    return 0;
+}
+
+void Sysdeps<ThreadExit>::operator()() {
+    __do_syscall1(INSTANTOS_SYS_THREAD_EXIT, 0);
+    __builtin_unreachable();
+}
+
+#endif  // !MLIBC_BUILDING_RTLD
+
 int Sysdeps<Ioctl>::operator()(int fd, unsigned long request, void* arg, int* result) {
     long handle = handle_for_fd(fd);
     if (handle < 0) return EBADF;
@@ -760,7 +1007,9 @@ int Sysdeps<Sigaction>::operator()(int signum, const struct sigaction* __restric
         kact.handler = reinterpret_cast<unsigned long>(act->sa_handler);
         kact.mask = act->sa_mask.__sig[0];
         kact.flags = act->sa_flags;
-        kact.restorer = reinterpret_cast<unsigned long>(act->sa_restorer);
+        // mlibc leaves sa_restorer unset; always install our sigreturn trampoline
+        // so a returning handler restores context instead of jumping to garbage.
+        kact.restorer = reinterpret_cast<unsigned long>(&__instantos_sigrestorer);
     }
 
     long ret = __do_syscall3(INSTANTOS_SYS_SIGACTION, signum,
@@ -827,10 +1076,14 @@ int Sysdeps<Pipe>::operator()(int* fds, int) {
     return 0;
 }
 
-int Sysdeps<Openat>::operator()(int, const char* path, int flags, mode_t mode, int* fd) {
-    // No *at semantics yet; ignore dirfd and treat path as absolute/cwd-relative.
-    long ret = __do_syscall3(INSTANTOS_SYS_OPEN, reinterpret_cast<long>(path), flags, mode);
-    if (int e = sc_error(ret); e) return e;
+int Sysdeps<Openat>::operator()(int dirfd, const char* path, int flags, mode_t mode, int* fd) {
+    // Resolve `path` against the directory fd (openat with a real dirfd is used
+    // heavily by coreutils/find fts).
+    char buf[512]; int e;
+    const char* p = at_resolve(dirfd, path, buf, sizeof(buf), &e);
+    if (!p) return e;
+    long ret = __do_syscall3(INSTANTOS_SYS_OPEN, reinterpret_cast<long>(p), flags, mode);
+    if (int e2 = sc_error(ret); e2) return e2;
     int localFd = register_fd(ret);
     if (localFd < 0) {
         __do_syscall1(INSTANTOS_SYS_CLOSE, ret);
@@ -857,6 +1110,12 @@ int Sysdeps<Waitpid>::operator()(pid_t pid, int* status, int flags, struct rusag
 }
 
 int Sysdeps<Execve>::operator()(const char* path, char* const argv[], char* const envp[]) {
+    // Preserve the fd-number -> kernel-handle map across the image replacement so
+    // inherited fds beyond stdio (e.g. a `make -j` jobserver pipe on fd 3/4)
+    // survive exec. The kernel keeps the handle table (dropping CLOEXEC); this
+    // snapshot lets the new image's libc rebuild its userspace fd map at entry
+    // (see __instantos_restore_fdtable / entry.cpp).
+    __do_syscall2(INSTANTOS_SYS_FDTABLE_STASH, reinterpret_cast<long>(fdTable), kMaxFd);
     long ret = __do_syscall3(INSTANTOS_SYS_EXEC, reinterpret_cast<long>(path),
                              reinterpret_cast<long>(argv), reinterpret_cast<long>(envp));
     // Only returns on failure.
@@ -906,43 +1165,64 @@ int Sysdeps<Rename>::operator()(const char* path, const char* new_path) {
     return sc_error(ret);
 }
 
-int Sysdeps<Renameat>::operator()(int /*olddirfd*/, const char* old_path,
-                                  int /*newdirfd*/, const char* new_path) {
-    // Only AT_FDCWD-relative paths are supported; ignore dirfds. mlibc's
-    // rename() routes through Renameat, so this is the path coreutils' mv uses.
-    long ret = __do_syscall2(INSTANTOS_SYS_RENAME, reinterpret_cast<long>(old_path),
-                             reinterpret_cast<long>(new_path));
+int Sysdeps<Renameat>::operator()(int olddirfd, const char* old_path,
+                                  int newdirfd, const char* new_path) {
+    // mlibc's rename() also routes through Renameat (with AT_FDCWD). Resolve
+    // each path against its directory fd so renameat(dirfd, ...) works too.
+    char ob[512], nb[512]; int e1, e2;
+    const char* op = at_resolve(olddirfd, old_path, ob, sizeof(ob), &e1);
+    if (!op) return e1;
+    const char* np = at_resolve(newdirfd, new_path, nb, sizeof(nb), &e2);
+    if (!np) return e2;
+    long ret = __do_syscall2(INSTANTOS_SYS_RENAME, reinterpret_cast<long>(op),
+                             reinterpret_cast<long>(np));
     return sc_error(ret);
 }
 
 // --- *at variants: coreutils invokes these instead of the base calls -------
-// Each ignores dirfd (AT_FDCWD-relative only) and delegates to the existing
-// kernel syscall.
+// Each resolves the path against its directory fd (at_resolve) and delegates to
+// the existing kernel syscall.
 
-int Sysdeps<Fchmodat>::operator()(int /*dirfd*/, const char* pathname, mode_t mode, int /*flags*/) {
-    long ret = __do_syscall3(INSTANTOS_SYS_CHMOD, reinterpret_cast<long>(pathname),
+int Sysdeps<Fchmodat>::operator()(int dirfd, const char* pathname, mode_t mode, int /*flags*/) {
+    char buf[512]; int e;
+    const char* p = at_resolve(dirfd, pathname, buf, sizeof(buf), &e);
+    if (!p) return e;
+    long ret = __do_syscall3(INSTANTOS_SYS_CHMOD, reinterpret_cast<long>(p),
                              static_cast<long>(mode), 0);
     return sc_error(ret);
 }
 
-int Sysdeps<Linkat>::operator()(int /*olddirfd*/, const char* old_path,
-                                int /*newdirfd*/, const char* new_path, int /*flags*/) {
-    long ret = __do_syscall2(INSTANTOS_SYS_LINK, reinterpret_cast<long>(old_path),
-                             reinterpret_cast<long>(new_path));
+int Sysdeps<Linkat>::operator()(int olddirfd, const char* old_path,
+                                int newdirfd, const char* new_path, int /*flags*/) {
+    char ob[512], nb[512]; int e1, e2;
+    const char* op = at_resolve(olddirfd, old_path, ob, sizeof(ob), &e1);
+    if (!op) return e1;
+    const char* np = at_resolve(newdirfd, new_path, nb, sizeof(nb), &e2);
+    if (!np) return e2;
+    long ret = __do_syscall2(INSTANTOS_SYS_LINK, reinterpret_cast<long>(op),
+                             reinterpret_cast<long>(np));
     return sc_error(ret);
 }
 
-int Sysdeps<Symlinkat>::operator()(const char* target_path, int /*dirfd*/, const char* link_path) {
+int Sysdeps<Symlinkat>::operator()(const char* target_path, int dirfd, const char* link_path) {
+    // target_path is the symlink's contents (not resolved); only link_path is
+    // resolved against the directory fd.
+    char buf[512]; int e;
+    const char* lp = at_resolve(dirfd, link_path, buf, sizeof(buf), &e);
+    if (!lp) return e;
     long ret = __do_syscall2(INSTANTOS_SYS_SYMLINK, reinterpret_cast<long>(target_path),
-                             reinterpret_cast<long>(link_path));
+                             reinterpret_cast<long>(lp));
     return sc_error(ret);
 }
 
-int Sysdeps<Readlinkat>::operator()(int /*dirfd*/, const char* path, void* buffer,
+int Sysdeps<Readlinkat>::operator()(int dirfd, const char* path, void* buffer,
                                     size_t max_size, ssize_t* length) {
-    long ret = __do_syscall3(INSTANTOS_SYS_READLINK, reinterpret_cast<long>(path),
+    char buf[512]; int e;
+    const char* p = at_resolve(dirfd, path, buf, sizeof(buf), &e);
+    if (!p) return e;
+    long ret = __do_syscall3(INSTANTOS_SYS_READLINK, reinterpret_cast<long>(p),
                              reinterpret_cast<long>(buffer), static_cast<long>(max_size));
-    if (int e = sc_error(ret); e) return e;
+    if (int e2 = sc_error(ret); e2) return e2;
     *length = ret;
     return 0;
 }
@@ -1013,26 +1293,35 @@ int Sysdeps<Fchownat>::operator()(int dirfd, const char* pathname, uid_t owner, 
                                  static_cast<long>(flags));
         return sc_error(ret);
     }
-    // Path-based (AT_FDCWD only). flags may carry AT_SYMLINK_NOFOLLOW for lchown.
-    long ret = __do_syscall5(INSTANTOS_SYS_CHOWN, reinterpret_cast<long>(pathname), 0,
+    // Path-based: resolve against the directory fd. flags may carry
+    // AT_SYMLINK_NOFOLLOW for lchown.
+    char buf[512]; int e;
+    const char* p = at_resolve(dirfd, pathname, buf, sizeof(buf), &e);
+    if (!p) return e;
+    long ret = __do_syscall5(INSTANTOS_SYS_CHOWN, reinterpret_cast<long>(p), 0,
                              static_cast<long>(owner), static_cast<long>(group),
                              static_cast<long>(flags));
     return sc_error(ret);
 }
 
-int Sysdeps<Mknodat>::operator()(int /*dirfd*/, const char* path, int mode, int dev) {
-    // Only AT_FDCWD-relative paths are supported; ignore dirfd. The kernel
-    // sys_mknod selects the node type from the S_IFMT bits in `mode`.
-    long ret = __do_syscall3(INSTANTOS_SYS_MKNOD, reinterpret_cast<long>(path),
+int Sysdeps<Mknodat>::operator()(int dirfd, const char* path, int mode, int dev) {
+    // The kernel sys_mknod selects the node type from the S_IFMT bits in `mode`.
+    char buf[512]; int e;
+    const char* p = at_resolve(dirfd, path, buf, sizeof(buf), &e);
+    if (!p) return e;
+    long ret = __do_syscall3(INSTANTOS_SYS_MKNOD, reinterpret_cast<long>(p),
                              static_cast<long>(static_cast<unsigned>(mode)),
                              static_cast<long>(static_cast<unsigned>(dev)));
     return sc_error(ret);
 }
 
-int Sysdeps<Mkfifoat>::operator()(int /*dirfd*/, const char* path, mode_t mode) {
+int Sysdeps<Mkfifoat>::operator()(int dirfd, const char* path, mode_t mode) {
     // mkfifo always creates a FIFO: force the S_IFIFO type bit.
+    char buf[512]; int e;
+    const char* p = at_resolve(dirfd, path, buf, sizeof(buf), &e);
+    if (!p) return e;
     constexpr unsigned kSIFIFO = 0x1000;
-    long ret = __do_syscall3(INSTANTOS_SYS_MKNOD, reinterpret_cast<long>(path),
+    long ret = __do_syscall3(INSTANTOS_SYS_MKNOD, reinterpret_cast<long>(p),
                              static_cast<long>((static_cast<unsigned>(mode) & 07777) | kSIFIFO),
                              0);
     return sc_error(ret);
@@ -1173,20 +1462,41 @@ int Sysdeps<Readlink>::operator()(const char* path, void* buffer, size_t max_siz
     return 0;
 }
 
-int Sysdeps<Fchdir>::operator()(int /*fd*/) {
-    // The kernel has no fd->path lookup, and chdir is path-based. mlibc only
-    // needs this for fchdir(); report ENOSYS so callers fall back to a
-    // path-based chdir where possible.
-    return ENOSYS;
+int Sysdeps<Fchdir>::operator()(int fd) {
+    // chdir is path-based; resolve the fd to its directory path and chdir there.
+    long handle = handle_for_fd(fd);
+    if (handle < 0) return EBADF;
+    char dir[256];
+    long n = __do_syscall3(INSTANTOS_SYS_FD_PATH, handle,
+                           reinterpret_cast<long>(dir), static_cast<long>(sizeof(dir)));
+    if (int e = sc_error(n); e) return e;
+    return sc_error(__do_syscall1(INSTANTOS_SYS_CHDIR, reinterpret_cast<long>(dir)));
 }
 
 int Sysdeps<Utimensat>::operator()(int dirfd, const char* pathname,
                                    const struct timespec times[2], int flags) {
     // The kernel Utime takes second-resolution atime/mtime and has no OMIT
     // concept, so resolve UTIME_NOW/UTIME_OMIT (and a null times) here.
-    // Only AT_FDCWD-relative paths are supported.
-    (void)dirfd;
-    (void)flags;
+    //
+    // Two modes:
+    //   pathname != null -> utimensat(dirfd, path, ...): resolve to an absolute
+    //     path and use the path-based Utime.
+    //   pathname == null -> futimens(fd, ...) is routed here (mlibc calls this
+    //     sysdep with dirfd == fd, pathname == null). Operate on the open file
+    //     handle via the by-handle Utime; the *at path resolver rejects a null
+    //     path with EINVAL, so it must not be used for this case.
+    const bool byHandle = (pathname == nullptr);
+    char buf[512];
+    long target;                 // absolute-path pointer, or a kernel fd handle
+    if (byHandle) {
+        target = handle_for_fd(dirfd);
+        if (target < 0) return EBADF;
+    } else {
+        int rerr;
+        const char* p = at_resolve(dirfd, pathname, buf, sizeof(buf), &rerr);
+        if (!p) return rerr;
+        target = reinterpret_cast<long>(p);
+    }
 
     long now = __do_syscall0(INSTANTOS_SYS_GETUNIXTIME);
     long atime = now;
@@ -1202,11 +1512,13 @@ int Sysdeps<Utimensat>::operator()(int dirfd, const char* pathname,
 
     long existAtime = now;
     long existMtime = now;
-    if (needExisting && pathname) {
+    if (needExisting) {
         instantos_stat ks;
-        long sret = __do_syscall2((flags & AT_SYMLINK_NOFOLLOW) ? INSTANTOS_SYS_LSTAT
-                                                                : INSTANTOS_SYS_STAT,
-                                  reinterpret_cast<long>(pathname), reinterpret_cast<long>(&ks));
+        long sret = byHandle
+            ? __do_syscall2(INSTANTOS_SYS_FSTAT, target, reinterpret_cast<long>(&ks))
+            : __do_syscall2((flags & AT_SYMLINK_NOFOLLOW) ? INSTANTOS_SYS_LSTAT
+                                                          : INSTANTOS_SYS_STAT,
+                            target, reinterpret_cast<long>(&ks));
         if (!sc_error(sret)) {
             existAtime = static_cast<long>(ks.k_atime);
             existMtime = static_cast<long>(ks.k_mtime);
@@ -1226,9 +1538,8 @@ int Sysdeps<Utimensat>::operator()(int dirfd, const char* pathname,
         }
     }
 
-    // sys_utime(target=path, atime, mtime, byHandle=0)
-    long ret = __do_syscall4(INSTANTOS_SYS_UTIME, reinterpret_cast<long>(pathname),
-                             atime, mtime, 0);
+    // sys_utime(target = path pointer or fd handle, atime, mtime, byHandle)
+    long ret = __do_syscall4(INSTANTOS_SYS_UTIME, target, atime, mtime, byHandle ? 1 : 0);
     return sc_error(ret);
 }
 
@@ -1240,13 +1551,117 @@ int Sysdeps<Access>::operator()(const char* path, int mode) {
 }
 
 int Sysdeps<Faccessat>::operator()(int dirfd, const char* pathname, int mode, int flags) {
-    // Only AT_FDCWD-relative paths are supported; ignore dirfd and AT_* flags
-    // (AT_EACCESS is moot under the single-credential model).
-    (void)dirfd;
+    // Resolve against the directory fd; AT_* flags (AT_EACCESS) are moot under
+    // the single-credential model.
     (void)flags;
-    long ret = __do_syscall2(INSTANTOS_SYS_ACCESS, reinterpret_cast<long>(pathname),
+    char buf[512]; int e;
+    const char* p = at_resolve(dirfd, pathname, buf, sizeof(buf), &e);
+    if (!p) return e;
+    long ret = __do_syscall2(INSTANTOS_SYS_ACCESS, reinterpret_cast<long>(p),
                              static_cast<long>(mode));
     return sc_error(ret);
+}
+
+// --- P2.1d: durability, positioned I/O, alt signal stack, rusage, ttyname ---
+
+int Sysdeps<Fsync>::operator()(int fd) {
+    long handle = handle_for_fd(fd);
+    if (handle < 0) return EBADF;
+    return sc_error(__do_syscall1(INSTANTOS_SYS_FSYNC, handle));
+}
+
+int Sysdeps<Fdatasync>::operator()(int fd) {
+    // The kernel fsync flushes data + metadata; fdatasync maps to the same call.
+    long handle = handle_for_fd(fd);
+    if (handle < 0) return EBADF;
+    return sc_error(__do_syscall1(INSTANTOS_SYS_FSYNC, handle));
+}
+
+int Sysdeps<Pread>::operator()(int fd, void* buf, size_t n, off_t off, ssize_t* bytes_read) {
+    // No positioned-read syscall: save the current offset, seek+read, restore.
+    // Single-threaded-safe (an fd is not shared concurrently within a process).
+    constexpr long kSeekSet = 0, kSeekCur = 1;
+    long handle = handle_for_fd(fd);
+    if (handle < 0) return EBADF;
+    long saved = __do_syscall3(INSTANTOS_SYS_SEEK, handle, 0, kSeekCur);
+    if (int e = sc_error(saved); e) return e;
+    if (int e = sc_error(__do_syscall3(INSTANTOS_SYS_SEEK, handle, static_cast<long>(off), kSeekSet)); e)
+        return e;
+    long r = __do_syscall3(INSTANTOS_SYS_READ, handle, reinterpret_cast<long>(buf), static_cast<long>(n));
+    int rerr = sc_error(r);
+    __do_syscall3(INSTANTOS_SYS_SEEK, handle, saved, kSeekSet);   // restore offset
+    if (rerr) return rerr;
+    *bytes_read = r;
+    return 0;
+}
+
+int Sysdeps<Pwrite>::operator()(int fd, const void* buf, size_t n, off_t off, ssize_t* bytes_written) {
+    constexpr long kSeekSet = 0, kSeekCur = 1;
+    long handle = handle_for_fd(fd);
+    if (handle < 0) return EBADF;
+    long saved = __do_syscall3(INSTANTOS_SYS_SEEK, handle, 0, kSeekCur);
+    if (int e = sc_error(saved); e) return e;
+    if (int e = sc_error(__do_syscall3(INSTANTOS_SYS_SEEK, handle, static_cast<long>(off), kSeekSet)); e)
+        return e;
+    long w = __do_syscall3(INSTANTOS_SYS_WRITE, handle, reinterpret_cast<long>(buf), static_cast<long>(n));
+    int werr = sc_error(w);
+    __do_syscall3(INSTANTOS_SYS_SEEK, handle, saved, kSeekSet);
+    if (werr) return werr;
+    *bytes_written = w;
+    return 0;
+}
+
+int Sysdeps<Sigaltstack>::operator()(const stack_t* ss, stack_t* oss) {
+    // Kernel SignalStackInfo layout: {u64 sp; u64 size; u32 flags; u32 reserved}.
+    // mlibc's stack_t orders the fields differently, so translate both ways.
+    struct instantos_sigaltstack {
+        unsigned long sp;
+        unsigned long size;
+        unsigned int flags;
+        unsigned int reserved;
+    };
+    instantos_sigaltstack in{};
+    instantos_sigaltstack out{};
+    if (ss) {
+        in.sp = reinterpret_cast<unsigned long>(ss->ss_sp);
+        in.size = static_cast<unsigned long>(ss->ss_size);
+        in.flags = static_cast<unsigned int>(ss->ss_flags);
+    }
+    long ret = __do_syscall2(INSTANTOS_SYS_SIGALTSTACK,
+                             ss ? reinterpret_cast<long>(&in) : 0,
+                             oss ? reinterpret_cast<long>(&out) : 0);
+    if (int e = sc_error(ret); e) return e;
+    if (oss) {
+        oss->ss_sp = reinterpret_cast<void*>(out.sp);
+        oss->ss_size = static_cast<size_t>(out.size);
+        oss->ss_flags = static_cast<int>(out.flags);
+    }
+    return 0;
+}
+
+int Sysdeps<GetRusage>::operator()(int, struct rusage* usage) {
+    // No per-process resource accounting yet; report an all-zero rusage. Callers
+    // (the `time` builtin, make's timing) tolerate zeros.
+    if (usage) {
+        char* p = reinterpret_cast<char*>(usage);
+        for (size_t i = 0; i < sizeof(*usage); ++i) p[i] = 0;
+    }
+    return 0;
+}
+
+int Sysdeps<Ttyname>::operator()(int fd, char* buf, size_t size) {
+    long handle = handle_for_fd(fd);
+    if (handle < 0) return EBADF;
+    // Must refer to a terminal.
+    struct instantos_winsize ws;
+    if (sc_error(__do_syscall3(INSTANTOS_SYS_IOCTL, handle, TIOCGWINSZ, reinterpret_cast<long>(&ws)))) {
+        return ENOTTY;
+    }
+    // Report the path the terminal was opened with (e.g. /dev/pts/N).
+    long n = __do_syscall3(INSTANTOS_SYS_FD_PATH, handle, reinterpret_cast<long>(buf),
+                           static_cast<long>(size));
+    if (sc_error(n)) return ENOTTY;
+    return 0;
 }
 
 // --- Sockets -------------------------------------------------------------
@@ -1544,4 +1959,47 @@ int Sysdeps<Uname>::operator()(struct utsname* buf) {
     return 0;
 }
 
+}  // namespace mlibc
+
+// --- New-thread entry path (global, C-linkage) ---------------------------
+//
+// Excluded from the runtime linker for the same reason as the sysdeps above.
+#ifndef MLIBC_BUILDING_RTLD
+//
+// sys_thread_clone() starts a freshly spawned thread here with rsp pointing at
+// the stack laid out by Sysdeps<PrepareStack>: [entry][tcb][arg][nul]. Pop those
+// into the SysV argument registers and tail into the C trampoline. No TLS (fs)
+// access may occur here — the trampoline installs it via TcbSet first.
+asm(
+    ".pushsection .text\n"
+    ".globl __mlibc_thread_entry\n"
+    ".type __mlibc_thread_entry, @function\n"
+    "__mlibc_thread_entry:\n"
+    "    popq %rdi\n"   // entry (start routine)
+    "    popq %rsi\n"   // tcb
+    "    popq %rdx\n"   // user_arg
+    "    popq %rcx\n"   // nul filler
+    "    call __mlibc_thread_trampoline\n"
+    ".size __mlibc_thread_entry, . - __mlibc_thread_entry\n"
+    ".popsection\n"
+);
+
+// Runs on the new thread's own stack. Marked no_stack_protector because it must
+// not touch TLS (where the stack canary lives) before TcbSet has installed it.
+extern "C" __attribute__((no_stack_protector)) void
+__mlibc_thread_trampoline(void* (*fn)(void*), Tcb* tcb, void* arg) {
+    if (mlibc::sysdep<TcbSet>(tcb))
+        __ensure(!"instantos: failed to set TCB for new thread");
+
+    // Wait until the parent publishes our TID (FutexWait yields to it).
+    while (__atomic_load_n(&tcb->tid, __ATOMIC_RELAXED) == 0)
+        mlibc::sysdep<FutexWait>(&tcb->tid, 0, nullptr);
+
+    __atomic_fetch_or(&tcb->cancelBits, tcbCancelEnableBit, __ATOMIC_RELAXED);
+
+    tcb->invokeThreadFunc(reinterpret_cast<void*>(fn), arg);
+
+    mlibc::thread_exit(tcb->returnValue);
 }
+
+#endif  // !MLIBC_BUILDING_RTLD

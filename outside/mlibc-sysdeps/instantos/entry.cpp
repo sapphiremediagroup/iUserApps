@@ -2,14 +2,14 @@
 #include <stdlib.h>
 #include <mlibc/elf/startup.h>
 
-#include <bits/syscall.h>
-
 extern "C" void __dlapi_enter(uintptr_t*);
-extern "C" long __do_syscall2(long, long, long);
 extern char** environ;
 
-namespace {
-
+extern "C" void __mlibc_entry(uintptr_t* entry_stack, int (*main_fn)(int, char**, char**)) {
+    __dlapi_enter(entry_stack);
+    int result = main_fn(mlibc::entry_stack.argc, mlibc::entry_stack.argv, environ);
+    exit(result);
+}
 size_t cstr_len(const char* text) {
     size_t length = 0;
     while (text[length]) {

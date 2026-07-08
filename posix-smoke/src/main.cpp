@@ -1177,6 +1177,137 @@ int test_ipc()
     }
     close(fds[0]);
     close(fds[1]);
+
+    // ---- Named FIFO edge cases ------------------------------------------
+    // These exercise O_NONBLOCK read/write behavior, poll() readiness, and
+    // SIGPIPE/EPIPE on write-to-closed-reader for named FIFOs. A FIFO opened
+    // O_RDWR never blocks at open() time, so a single process can hold both
+    // ends for these checks.
+    const char* fifoPath = "/tmp/posix-smoke.fifo";
+    unlink(fifoPath);
+    if (mkfifo(fifoPath, 0600) != 0) {
+        return fail("mkfifo");
+    }
+
+    // (1a) O_NONBLOCK read on an empty FIFO must return EAGAIN, not block.
+    int rw = open(fifoPath, O_RDWR | O_NONBLOCK);
+    if (rw < 0) {
+        unlink(fifoPath);
+        return fail("fifo open rdwr nonblock");
+    }
+    char c = 0;
+    errno = 0;
+    ssize_t n = read(rw, &c, 1);
+    if (n != -1 || (errno != EAGAIN && errno != EWOULDBLOCK)) {
+        close(rw);
+        unlink(fifoPath);
+        return fail("fifo nonblock read EAGAIN");
+    }
+
+    // (1b) poll() must report no POLLIN yet, and POLLOUT (writable).
+    pollfd fpoll {};
+    fpoll.fd = rw;
+    fpoll.events = POLLIN | POLLOUT;
+    fpoll.revents = 0;
+    if (poll(&fpoll, 1, 0) < 0 || (fpoll.revents & POLLIN) != 0 ||
+        (fpoll.revents & POLLOUT) == 0) {
+        close(rw);
+        unlink(fifoPath);
+        return fail("fifo poll empty");
+    }
+
+    // (1c) After a nonblocking write, the byte round-trips and poll sees POLLIN.
+    const char msg = 'Z';
+    if (write(rw, &msg, 1) != 1) {
+        close(rw);
+        unlink(fifoPath);
+        return fail("fifo nonblock write");
+    }
+    fpoll.events = POLLIN;
+    fpoll.revents = 0;
+    if (poll(&fpoll, 1, 0) != 1 || (fpoll.revents & POLLIN) == 0) {
+        close(rw);
+        unlink(fifoPath);
+        return fail("fifo poll readable");
+    }
+    c = 0;
+    if (read(rw, &c, 1) != 1 || c != msg) {
+        close(rw);
+        unlink(fifoPath);
+        return fail("fifo read payload");
+    }
+    close(rw);
+
+    // (2) Multiple concurrent writers into one FIFO: bytes from both writers
+    // must all reach the single reader without loss. Use O_RDWR handles so no
+    // open() rendezvous is required.
+    int rd = open(fifoPath, O_RDWR);
+    int w1 = open(fifoPath, O_WRONLY | O_NONBLOCK);
+    int w2 = open(fifoPath, O_WRONLY | O_NONBLOCK);
+    if (rd < 0 || w1 < 0 || w2 < 0) {
+        if (rd >= 0) close(rd);
+        if (w1 >= 0) close(w1);
+        if (w2 >= 0) close(w2);
+        unlink(fifoPath);
+        return fail("fifo multi open");
+    }
+    if (write(w1, "AA", 2) != 2 || write(w2, "BB", 2) != 2) {
+        close(rd); close(w1); close(w2);
+        unlink(fifoPath);
+        return fail("fifo multi write");
+    }
+    char buf[4] = {0};
+    ssize_t got = read(rd, buf, sizeof(buf));
+    if (got != 4) {
+        close(rd); close(w1); close(w2);
+        unlink(fifoPath);
+        return fail("fifo multi read count");
+    }
+    int aCount = 0, bCount = 0;
+    for (int i = 0; i < 4; ++i) {
+        if (buf[i] == 'A') ++aCount;
+        else if (buf[i] == 'B') ++bCount;
+    }
+    if (aCount != 2 || bCount != 2) {
+        close(rd); close(w1); close(w2);
+        unlink(fifoPath);
+        return fail("fifo multi read payload");
+    }
+    close(w1);
+    close(w2);
+    close(rd);
+
+    // (3) SIGPIPE / EPIPE on write to a FIFO with no readers. Ignore SIGPIPE so
+    // write() returns -1/EPIPE instead of terminating the process; the writer
+    // opens O_WRONLY|O_NONBLOCK (no reader present) and writes.
+    struct sigaction ign {};
+    ign.sa_handler = SIG_IGN;
+    struct sigaction prev {};
+    sigaction(SIGPIPE, &ign, &prev);
+
+    // With no reader, a nonblocking O_WRONLY open would normally fail with
+    // ENXIO; hold a reader briefly, then close it so writeOpen sees no readers.
+    int holdReader = open(fifoPath, O_RDWR);
+    int writer = open(fifoPath, O_WRONLY | O_NONBLOCK);
+    if (holdReader < 0 || writer < 0) {
+        if (holdReader >= 0) close(holdReader);
+        if (writer >= 0) close(writer);
+        sigaction(SIGPIPE, &prev, nullptr);
+        unlink(fifoPath);
+        return fail("fifo sigpipe open");
+    }
+    close(holdReader); // now the FIFO has no readers
+    errno = 0;
+    ssize_t w = write(writer, "x", 1);
+    if (w != -1 || errno != EPIPE) {
+        close(writer);
+        sigaction(SIGPIPE, &prev, nullptr);
+        unlink(fifoPath);
+        return fail("fifo write EPIPE");
+    }
+    close(writer);
+    sigaction(SIGPIPE, &prev, nullptr);
+    unlink(fifoPath);
     return 0;
 }
 
