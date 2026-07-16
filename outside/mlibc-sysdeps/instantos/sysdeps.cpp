@@ -142,14 +142,19 @@ long handle_for_fd(int fd) {
     return fdTable[fd];
 }
 
-int register_fd(long handle) {
-    for (int fd = 3; fd < kMaxFd; ++fd) {
+int register_fd_min(long handle, int min) {
+    if (min < 0) min = 0;
+    for (int fd = min; fd < kMaxFd; ++fd) {
         if (fdTable[fd] == 0) {
             fdTable[fd] = handle;
             return fd;
         }
     }
     return -1;
+}
+
+int register_fd(long handle) {
+    return register_fd_min(handle, 3);
 }
 
 int register_fd_at(int fd, long handle) {
@@ -742,9 +747,12 @@ int Sysdeps<Fcntl>::operator()(int fd, int request, va_list args, int* result) {
     if (int e = sc_error(ret); e) return e;
 
     // F_DUPFD / F_DUPFD_CLOEXEC return a kernel handle that must be mapped to a
-    // new userspace fd; other commands return a plain value.
+    // new userspace fd. POSIX requires the LOWEST available fd >= arg (the third
+    // fcntl argument): bash relies on this to move saved fds into a high range
+    // (SHELL_FD_BASE=10) during redirection save/restore. Honoring the minimum
+    // (instead of always starting at fd 3) keeps bash's fd bookkeeping correct.
     if (request == F_DUPFD || request == F_DUPFD_CLOEXEC) {
-        int newfd = register_fd(ret);
+        int newfd = register_fd_min(ret, static_cast<int>(arg));
         if (newfd < 0) {
             __do_syscall1(INSTANTOS_SYS_CLOSE, ret);
             return EMFILE;

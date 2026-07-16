@@ -1,3 +1,6 @@
 [submodule "outside/ilibcxx"]
 	path = outside/ilibcxx
 	url = https://github.com/sapphiremediagroup/ilibcxx
+[submodule "outside/tinycc"]
+	path = outside/tinycc
+	url = https://repo.or.cz/tinycc.git
