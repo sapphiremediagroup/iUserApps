@@ -122,6 +122,8 @@ struct InstantosSysdepTags :
 	Uname,
 	GetEntropy,
 	GetLoadavg,
+	Sysconf,
+	Brk,
 	Msync,
 	Fsync,
 	Fdatasync,

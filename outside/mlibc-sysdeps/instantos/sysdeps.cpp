@@ -19,6 +19,7 @@
 #include <sys/socket.h>
 #include <poll.h>
 #include <sys/utsname.h>
+#include <unistd.h>
 
 // Terminal ioctl request numbers (match the kernel PTY_TC* constants in
 // include/cpu/tty/pty.hpp, i.e. the Linux values). The linux abi-bits ioctls.h
@@ -97,6 +98,21 @@ struct instantos_mmap_file_args {
     unsigned long offset;
 };
 
+// Kernel OSInfo layout used to answer the sysconf memory queries without the
+// noisy mlibc fallback. Despite the historical field names, the RAM strings are
+// decimal MiB values (see Syscall::sys_osinfo()).
+struct instantos_os_info {
+    char osname[10];
+    char logged_on_user[32];
+    char cpu_name[64];
+    char total_ram_mb[8];
+    char used_ram_mb[8];
+    unsigned char major;
+    unsigned char minor;
+    unsigned char patch;
+    unsigned long build_number;
+};
+
 extern "C" long __do_syscall0(long);
 extern "C" long __do_syscall1(long, long);
 extern "C" long __do_syscall2(long, long, long);
@@ -140,6 +156,14 @@ long handle_for_fd(int fd) {
         return -1;
     }
     return fdTable[fd];
+}
+
+unsigned long parse_decimal(const char* value) {
+    unsigned long result = 0;
+    for (size_t i = 0; value[i] >= '0' && value[i] <= '9'; ++i) {
+        result = result * 10 + static_cast<unsigned long>(value[i] - '0');
+    }
+    return result;
 }
 
 int register_fd_min(long handle, int min) {
@@ -856,6 +880,42 @@ int Sysdeps<Msync>::operator()(void* pointer, size_t size, int flags) {
     long ret = __do_syscall3(INSTANTOS_SYS_MSYNC, reinterpret_cast<long>(pointer),
                              static_cast<long>(size), static_cast<long>(flags));
     return sc_error(ret);
+}
+
+int Sysdeps<Sysconf>::operator()(int number, long* result) {
+    if (!result) return EINVAL;
+
+    switch (number) {
+        case _SC_OPEN_MAX:
+            *result = kMaxFd;
+            return 0;
+        case _SC_CHILD_MAX:
+            *result = 1024;
+            return 0;
+        case _SC_NPROCESSORS_CONF:
+        case _SC_NPROCESSORS_ONLN:
+            *result = 1;
+            return 0;
+        case _SC_PHYS_PAGES:
+        case _SC_AVPHYS_PAGES: {
+            instantos_os_info info {};
+            long ret = __do_syscall1(INSTANTOS_SYS_OSINFO, reinterpret_cast<long>(&info));
+            if (int e = sc_error(ret); e) return e;
+            unsigned long total_mb = parse_decimal(info.total_ram_mb);
+            unsigned long used_mb = parse_decimal(info.used_ram_mb);
+            unsigned long available_mb = used_mb < total_mb ? total_mb - used_mb : 0;
+            *result = static_cast<long>((number == _SC_PHYS_PAGES ? total_mb : available_mb) * 256);
+            return 0;
+        }
+        default:
+            return EINVAL;
+    }
+}
+
+int Sysdeps<Brk>::operator()(void**) {
+    // InstantOS allocations are mmap-backed. mlibc only calls this for sbrk(0),
+    // so report the unsupported brk arena without emitting a missing-sysdep log.
+    return ENOMEM;
 }
 
 int Sysdeps<ClockGet>::operator()(int clock, time_t* secs, long* nanos) {
