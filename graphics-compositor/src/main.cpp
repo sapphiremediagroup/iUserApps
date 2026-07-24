@@ -1,4 +1,5 @@
 #include "common.hpp"
+#include "backend.hpp"
 
 class GraphicsCompositor {
 public:
@@ -16,9 +17,10 @@ public:
         }
     }
 
-    int run() {
+    int run(int argc, char** argv) {
         if (!initializeService() ||
             !initializeFramebuffer() ||
+            !initializeBackend(argc, argv) ||
             !initializeFonts() ||
             !initializeBuffers()) {
             return 1;
@@ -36,6 +38,7 @@ private:
     std::Handle queue = fail;
     std::FBInfo fbInfo = {};
     FramebufferView framebuffer = {};
+    CompositorBackend* backend = nullptr;
     TripleBufferState buffers = {};
     RenderBuffer* sceneBuffer = nullptr;
     CursorState cursor = {};
@@ -88,6 +91,11 @@ private:
         return true;
     }
 
+    bool initializeBackend(int argc, char** argv) {
+        backend = compositor_backend_select(framebuffer, argc, argv);
+        return backend != nullptr;
+    }
+
     bool initializeFonts() {
         gUIFont = {};
         gClockTimeFont = {};
@@ -137,8 +145,7 @@ private:
         sceneBuffer = &buffers.acquire();
         updateWindowSnapshot();
         redraw_scene(*sceneBuffer, windowSnapshot, windowSnapshotCount, gSurfaceCache, &background, &taskbarBrand, &taskbarStatus, &windowControls);
-        present_to_framebuffer(*sceneBuffer, framebuffer);
-        present_cursor_move(*sceneBuffer, framebuffer, cursor, cursor, cursorImage);
+        backend->presentFull(*sceneBuffer, cursor, cursorImage);
         ++gTiming.frames;
     }
 
@@ -265,7 +272,7 @@ private:
             *fullSceneDirty = true;
         } else if (!*fullSceneDirty && (!windowDirty || rect_is_empty(*windowDirty)) &&
                    (previousCursor.x != cursor.x || previousCursor.y != cursor.y)) {
-            present_cursor_move(*sceneBuffer, framebuffer, previousCursor, cursor, cursorImage);
+            backend->presentCursorMove(*sceneBuffer, previousCursor, cursor, cursorImage);
         }
     }
 
@@ -338,8 +345,7 @@ private:
         updateWindowSnapshot();
         redraw_scene(*sceneBuffer, windowSnapshot, windowSnapshotCount, gSurfaceCache, &background, &taskbarBrand, &taskbarStatus, &windowControls);
         clear_surface_dirty_flags(gSurfaceCache);
-        present_to_framebuffer(*sceneBuffer, framebuffer);
-        present_cursor_move(*sceneBuffer, framebuffer, cursor, cursor, cursorImage);
+        backend->presentFull(*sceneBuffer, cursor, cursorImage);
         ++gTiming.frames;
         report_timing_if_needed();
     }
@@ -351,14 +357,13 @@ private:
         }
 
         redraw_scene_rect(*sceneBuffer, windowSnapshot, windowSnapshotCount, gSurfaceCache, &background, windowDirty, &taskbarBrand, &taskbarStatus, &windowControls);
-        present_rect_to_framebuffer(*sceneBuffer, framebuffer, windowDirty);
-        present_cursor_move(*sceneBuffer, framebuffer, cursor, cursor, cursorImage);
+        backend->presentRect(*sceneBuffer, windowDirty, cursor, cursorImage);
         ++gTiming.frames;
         report_timing_if_needed();
     }
 };
 
-int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv) {
+int main(int argc, char** argv) {
     GraphicsCompositor compositor;
-    return compositor.run();
+    return compositor.run(argc, argv);
 }
