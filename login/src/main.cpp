@@ -59,23 +59,21 @@ static bool ensureGraphicsCompositor() {
 }
 
 static char eventChar(const std::Event& event) {
-    if (event.type != std::EventType::Key || event.key.action != std::KeyEventAction::Press) {
+    if (event.type != std::EventType::Key || event.key.action == std::KeyEventAction::Release) {
+        return 0;
+    }
+    // Ctrl, Alt and Super combinations type nothing into a name or password.
+    if ((event.key.modifiers & (std::KeyModifierControl | std::KeyModifierAlt | std::KeyModifierSuper)) != 0) {
         return 0;
     }
 
-    if (event.key.keycode == '\r') {
+    if (event.key.keycode == std::KeyEnter || event.key.keycode == std::KeypadEnter) {
         return '\n';
     }
-
-    if (event.key.text[0] != '\0') {
-        return event.key.text[0];
+    if (event.key.keycode == std::KeyBackspace) {
+        return '\b';
     }
-
-    if (event.key.keycode == '\n' || event.key.keycode == '\b') {
-        return static_cast<char>(event.key.keycode);
-    }
-
-    return 0;
+    return event.key.text[0];
 }
 
 static int readLine(std::Handle inputQueue, char* buf, int maxLen, bool maskInput) {

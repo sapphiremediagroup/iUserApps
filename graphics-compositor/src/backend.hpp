@@ -19,13 +19,13 @@ public:
     virtual bool probe() = 0;
     virtual bool initialize(const FramebufferView& target) = 0;
 
-    virtual void presentFull(const RenderBuffer& scene,
+    virtual void presentFull(const ui::Canvas& scene,
                              const CursorState& cursor,
                              const CursorImage& cursorImage) = 0;
-    virtual void presentRect(const RenderBuffer& scene, const Rect& rect,
+    virtual void presentRect(const ui::Canvas& scene, const Rect& rect,
                              const CursorState& cursor,
                              const CursorImage& cursorImage) = 0;
-    virtual void presentCursorMove(const RenderBuffer& scene,
+    virtual void presentCursorMove(const ui::Canvas& scene,
                                    const CursorState& oldCursor,
                                    const CursorState& newCursor,
                                    const CursorImage& cursorImage) = 0;

@@ -1,21 +1,6 @@
 #include "common.hpp"
 
-#define STBI_ASSERT(x) ((void)0)
-#define STBI_NO_STDIO
-#define STBI_NO_THREAD_LOCALS
-#define STBI_ONLY_PNG
-#define STBI_NO_LINEAR
-#define STBI_NO_HDR
-#include <stb_image.h>
-
-void draw_gradient_pixels(std::uint32_t* pixels, std::uint32_t width, std::uint32_t height, std::uint32_t pitch) {
-    if (!pixels || width == 0 || height == 0) {
-        return;
-    }
-
-    const RenderBuffer buffer = { pixels, width, height, pitch };
-    draw_gradient(buffer);
-}
+namespace {
 
 bool ensure_background_storage(DesktopBackground* background, std::uint32_t width, std::uint32_t height) {
     if (!background || width == 0 || height == 0) {
@@ -43,13 +28,15 @@ bool ensure_background_storage(DesktopBackground* background, std::uint32_t widt
     return true;
 }
 
-void scale_background_image(DesktopBackground* background, int imageWidth, int imageHeight, const unsigned char* imagePixels) {
-    if (!background || !background->pixels || !imagePixels || imageWidth <= 0 || imageHeight <= 0) {
-        return;
-    }
+// The image fitted into the screen (nearest pixel, aspect kept) over the
+// default gradient, which shows in the bars it leaves.
+void scale_background_image(DesktopBackground* background, const ui::Image& image) {
+    ui::Canvas canvas(background->pixels, static_cast<int>(background->width),
+                      static_cast<int>(background->height), static_cast<int>(background->width));
+    canvas.gradient({ 0, 0, canvas.width(), canvas.height() }, ui::rgb(kBackground), ui::rgb(kBackgroundBottom));
 
-    draw_gradient_pixels(background->pixels, background->width, background->height, background->width);
-
+    const int imageWidth = image.width();
+    const int imageHeight = image.height();
     std::uint32_t drawWidth = background->width;
     std::uint32_t drawHeight = static_cast<std::uint32_t>((static_cast<std::uint64_t>(imageHeight) * background->width) / imageWidth);
     if (drawHeight > background->height) {
@@ -66,63 +53,27 @@ void scale_background_image(DesktopBackground* background, int imageWidth, int i
         const int srcY = static_cast<int>((static_cast<std::uint64_t>(y) * imageHeight) / drawHeight);
         for (std::uint32_t x = 0; x < drawWidth; ++x) {
             const int srcX = static_cast<int>((static_cast<std::uint64_t>(x) * imageWidth) / drawWidth);
-            const unsigned char* src = imagePixels + ((srcY * imageWidth + srcX) * 4);
-            RGBATexel pixel = {};
-            pixel.r = src[0];
-            pixel.g = src[1];
-            pixel.b = src[2];
-            pixel.a = 0xFFU;
+            ui::Color pixel = image.pixels()[srcY * imageWidth + srcX];
+            const std::uint8_t alpha = pixel.a;
+            pixel.a = 0xFF;
             std::uint32_t& dst = background->pixels[(offsetY + static_cast<int>(y)) * background->width + offsetX + static_cast<int>(x)];
-            dst = src[3] == 255 ? texel_to_word(pixel) : texel_to_word(blend(texel_word_to_rgba(dst), pixel, src[3]));
+            dst = alpha == 255 ? pixel.word() : ui::blend(ui::Color::from_word(dst), pixel, alpha).word();
         }
     }
 }
+
+}  // namespace
 
 bool load_background(DesktopBackground* background, std::uint32_t width, std::uint32_t height, const char* path) {
     if (!background || !path || path[0] == '\0' || !ensure_background_storage(background, width, height)) {
         return false;
     }
 
-    std::Stat stat = {};
-    if (std::stat(path, &stat) == fail || stat.st_size == 0) {
+    ui::Image image;
+    if (!image.load(path)) {
         return false;
     }
-
-    const std::Handle file = std::open(path, O_RDONLY);
-    if (file == fail) {
-        return false;
-    }
-
-    const std::size_t fileSize = static_cast<std::size_t>(stat.st_size);
-    unsigned char* encoded = new (std::nothrow) unsigned char[fileSize];
-    if (!encoded) {
-        std::close(file);
-        return false;
-    }
-
-    std::size_t totalRead = 0;
-    while (totalRead < fileSize) {
-        const std::uint64_t bytesRead = std::read(file, encoded + totalRead, fileSize - totalRead);
-        if (bytesRead == fail || bytesRead == 0) {
-            delete[] encoded;
-            std::close(file);
-            return false;
-        }
-        totalRead += static_cast<std::size_t>(bytesRead);
-    }
-    std::close(file);
-
-    int imageWidth = 0;
-    int imageHeight = 0;
-    int components = 0;
-    unsigned char* imagePixels = stbi_load_from_memory(encoded, static_cast<int>(fileSize), &imageWidth, &imageHeight, &components, 4);
-    delete[] encoded;
-    if (!imagePixels || imageWidth <= 0 || imageHeight <= 0) {
-        return false;
-    }
-
-    scale_background_image(background, imageWidth, imageHeight, imagePixels);
-    stbi_image_free(imagePixels);
+    scale_background_image(background, image);
 
     std::strncpy(background->currentPath, path, sizeof(background->currentPath) - 1);
     background->currentPath[sizeof(background->currentPath) - 1] = '\0';
@@ -158,60 +109,14 @@ bool load_first_available_background(DesktopBackground* background, std::uint32_
     return false;
 }
 
-void draw_background(const RenderBuffer& buffer, const DesktopBackground* background) {
+// The wallpaper, or the default gradient without one, over the canvas's clip.
+void draw_background(ui::Canvas& canvas, const DesktopBackground* background) {
+    const Rect screen = { 0, 0, canvas.width(), canvas.height() };
     if (!background || !background->pixels || !background->ready ||
-        background->width != buffer.width || background->height != buffer.height) {
-        draw_gradient(buffer);
+        background->width != static_cast<std::uint32_t>(canvas.width()) ||
+        background->height != static_cast<std::uint32_t>(canvas.height())) {
+        canvas.gradient(screen, ui::rgb(kBackground), ui::rgb(kBackgroundBottom));
         return;
     }
-
-    for (std::uint32_t y = 0; y < buffer.height; ++y) {
-        std::memcpy(
-            &buffer.pixels[y * buffer.pitch],
-            &background->pixels[y * background->width],
-            sizeof(RGBATexel) * buffer.width
-        );
-    }
-}
-
-void draw_background_rect(const RenderBuffer& buffer, const DesktopBackground* background, const Rect& rect) {
-    int startX = rect.x < 0 ? 0 : rect.x;
-    int startY = rect.y < 0 ? 0 : rect.y;
-    int endX = rect.x + rect.width;
-    int endY = rect.y + rect.height;
-    if (endX > static_cast<int>(buffer.width)) {
-        endX = static_cast<int>(buffer.width);
-    }
-    if (endY > static_cast<int>(buffer.height)) {
-        endY = static_cast<int>(buffer.height);
-    }
-    if (startX >= endX || startY >= endY) {
-        return;
-    }
-
-    if (!background || !background->pixels || !background->ready ||
-        background->width != buffer.width || background->height != buffer.height) {
-        for (int drawYInt = startY; drawYInt < endY; ++drawYInt) {
-            const std::uint32_t drawY = static_cast<std::uint32_t>(drawYInt);
-            const RGBATexel top = rgba_from_rgb(kBackground);
-            const RGBATexel bottom = rgba_from_rgb(kBackgroundBottom);
-            const std::uint32_t mix = (drawY * 255U) / (buffer.height > 1 ? (buffer.height - 1U) : 1U);
-            RGBATexel color = {};
-            color.r = static_cast<std::uint8_t>((top.r * (255U - mix) + bottom.r * mix) / 255U);
-            color.g = static_cast<std::uint8_t>((top.g * (255U - mix) + bottom.g * mix) / 255U);
-            color.b = static_cast<std::uint8_t>((top.b * (255U - mix) + bottom.b * mix) / 255U);
-            color.a = 0xFFU;
-            fill_texel_row(&buffer.pixels[drawY * buffer.pitch + static_cast<std::uint32_t>(startX)],
-                           static_cast<std::uint32_t>(endX - startX), color);
-        }
-        return;
-    }
-
-    for (int drawY = startY; drawY < endY; ++drawY) {
-        std::memcpy(
-            &buffer.pixels[drawY * buffer.pitch + static_cast<std::uint32_t>(startX)],
-            &background->pixels[drawY * background->width + static_cast<std::uint32_t>(startX)],
-            sizeof(std::uint32_t) * static_cast<std::uint32_t>(endX - startX)
-        );
-    }
+    canvas.copy(background->pixels, static_cast<int>(background->width), screen, { 0, 0 });
 }

@@ -129,6 +129,7 @@ add_subdirectory(background-switcher)
 add_subdirectory(file-browser)
 add_subdirectory(terminal)
 add_subdirectory(cube)
+add_subdirectory(ui-demo)
 # posix-smoke / net-smoke are conformance test apps (not runtime substrate and
 # not shipped in the os-testsuite ISO). posix-smoke uses a few declarations
 # (mkfifo/EWOULDBLOCK) that the clang header set exposes but GCC's does not, so

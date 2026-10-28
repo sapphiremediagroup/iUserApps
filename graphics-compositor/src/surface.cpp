@@ -25,10 +25,6 @@ bool build_hello_reply(const std::IPCMessage& message, std::services::graphics_c
     return true;
 }
 
-bool point_in_rect(int px, int py, int x, int y, int width, int height) {
-    return px >= x && py >= y && px < (x + width) && py < (y + height);
-}
-
 int frame_width(const std::WindowInfo& window) {
     return window.width + (kBorder * 2);
 }
@@ -82,12 +78,31 @@ void remember_surface(SurfaceCacheEntry* cache, const std::SurfaceInfo& info) {
         static_cast<int>(info.dirtyWidth),
         static_cast<int>(info.dirtyHeight)
     };
-    const Rect merged = union_rect(oldDirty, newDirty);
-    entry->dirty = !rect_is_empty(merged);
+    const Rect merged = oldDirty.unite(newDirty);
+    entry->dirty = !merged.empty();
     entry->dirtyX = static_cast<std::uint32_t>(merged.x);
     entry->dirtyY = static_cast<std::uint32_t>(merged.y);
     entry->dirtyWidth = static_cast<std::uint32_t>(merged.width);
     entry->dirtyHeight = static_cast<std::uint32_t>(merged.height);
+}
+
+// Drops the surfaces no window shows any more (a window that was resized got
+// a new one, or closed). The kernel unmaps a dead surface from us when we
+// list the windows, so this runs on each new list and nothing below may
+// still use their addresses.
+void forget_unshown_surfaces(SurfaceCacheEntry* cache, const std::WindowInfo* windows, std::uint64_t windowCount) {
+    for (std::uint64_t i = 0; i < kMaxSurfaceCache; ++i) {
+        if (!cache[i].valid) {
+            continue;
+        }
+        bool shown = false;
+        for (std::uint64_t w = 0; w < windowCount && !shown; ++w) {
+            shown = windows[w].surfaceID == cache[i].id;
+        }
+        if (!shown) {
+            cache[i] = {};
+        }
+    }
 }
 
 bool pump_surface_updates(SurfaceCacheEntry* cache) {
@@ -121,40 +136,16 @@ Rect window_control_rect(const std::WindowInfo& window, int control) {
     return { x, y, size, size };
 }
 
-void draw_line_rect(const RenderBuffer& buffer, int x0, int y0, int x1, int y1, int thickness, const RGBATexel& color) {
-    int dx = x1 > x0 ? x1 - x0 : x0 - x1;
-    int sx = x0 < x1 ? 1 : -1;
-    int dy = y1 > y0 ? y0 - y1 : y1 - y0;
-    int sy = y0 < y1 ? 1 : -1;
-    int error = dx + dy;
-
-    for (;;) {
-        fill_rect(buffer, x0 - (thickness / 2), y0 - (thickness / 2), thickness, thickness, color);
-        if (x0 == x1 && y0 == y1) {
-            break;
-        }
-        const int twiceError = error * 2;
-        if (twiceError >= dy) {
-            error += dy;
-            x0 += sx;
-        }
-        if (twiceError <= dx) {
-            error += dx;
-            y0 += sy;
-        }
-    }
-}
-
-void draw_window_control_icon_fallback(const RenderBuffer& buffer, const Rect& rect, int control, bool maximized) {
-    const RGBATexel iconColor = rgba_from_rgb(kTitleText);
+void draw_window_control_icon_fallback(ui::Canvas& canvas, const Rect& rect, int control, bool maximized) {
+    const ui::Color iconColor = ui::rgb(kTitleText);
     const int centerX = rect.x + (rect.width / 2);
     const int centerY = rect.y + (rect.height / 2);
     const int half = kControlIconSize / 2;
     const int thickness = 2;
 
     if (control == 0) {
-        draw_line_rect(buffer, centerX - half, centerY - half, centerX + half, centerY + half, thickness, iconColor);
-        draw_line_rect(buffer, centerX + half, centerY - half, centerX - half, centerY + half, thickness, iconColor);
+        canvas.line({ centerX - half, centerY - half }, { centerX + half, centerY + half }, iconColor, thickness);
+        canvas.line({ centerX + half, centerY - half }, { centerX - half, centerY + half }, iconColor, thickness);
         return;
     }
 
@@ -162,25 +153,25 @@ void draw_window_control_icon_fallback(const RenderBuffer& buffer, const Rect& r
         const int left = centerX - half;
         const int top = centerY - half;
         if (maximized) {
-            fill_rect(buffer, left + 3, top, kControlIconSize - 1, thickness, iconColor);
-            fill_rect(buffer, left + kControlIconSize, top, thickness, kControlIconSize - 1, iconColor);
-            fill_rect(buffer, left + 3, top + kControlIconSize - 1, kControlIconSize - 1, thickness, iconColor);
-            fill_rect(buffer, left + 2, top + 3, thickness, kControlIconSize - 1, iconColor);
+            canvas.fill({ left + 3, top, kControlIconSize - 1, thickness }, iconColor);
+            canvas.fill({ left + kControlIconSize, top, thickness, kControlIconSize - 1 }, iconColor);
+            canvas.fill({ left + 3, top + kControlIconSize - 1, kControlIconSize - 1, thickness }, iconColor);
+            canvas.fill({ left + 2, top + 3, thickness, kControlIconSize - 1 }, iconColor);
         } else {
-            fill_rect(buffer, left, top, kControlIconSize + 1, thickness, iconColor);
-            fill_rect(buffer, left, top, thickness, kControlIconSize + 1, iconColor);
-            fill_rect(buffer, left, top + kControlIconSize, kControlIconSize + 1, thickness, iconColor);
-            fill_rect(buffer, left + kControlIconSize, top, thickness, kControlIconSize + 1, iconColor);
+            canvas.fill({ left, top, kControlIconSize + 1, thickness }, iconColor);
+            canvas.fill({ left, top, thickness, kControlIconSize + 1 }, iconColor);
+            canvas.fill({ left, top + kControlIconSize, kControlIconSize + 1, thickness }, iconColor);
+            canvas.fill({ left + kControlIconSize, top, thickness, kControlIconSize + 1 }, iconColor);
         }
         return;
     }
 
-    fill_rect(buffer, centerX - half, centerY, kControlIconSize + 1, thickness, iconColor);
+    canvas.fill({ centerX - half, centerY, kControlIconSize + 1, thickness }, iconColor);
 }
 
-void draw_window_control_icon(const RenderBuffer& buffer, const Rect& rect, int control,
+void draw_window_control_icon(ui::Canvas& canvas, const Rect& rect, int control,
                               bool maximized, const WindowControlAssets* controls) {
-    const ImageAsset* icon = nullptr;
+    const ui::Image* icon = nullptr;
     if (controls) {
         if (control == 0) {
             icon = &controls->close;
@@ -191,21 +182,17 @@ void draw_window_control_icon(const RenderBuffer& buffer, const Rect& rect, int 
         }
     }
 
-    if (icon && icon->ready) {
+    if (icon && icon->valid()) {
         const int iconSize = kControlIconSize + 6;
-        draw_image_scaled(buffer,
-                          *icon,
-                          rect.x + ((rect.width - iconSize) / 2),
-                          rect.y + ((rect.height - iconSize) / 2),
-                          iconSize,
-                          iconSize);
+        canvas.image(*icon, Rect { rect.x + ((rect.width - iconSize) / 2), rect.y + ((rect.height - iconSize) / 2),
+                                   iconSize, iconSize });
         return;
     }
 
-    draw_window_control_icon_fallback(buffer, rect, control, maximized);
+    draw_window_control_icon_fallback(canvas, rect, control, maximized);
 }
 
-void draw_window_frame(const RenderBuffer& buffer, const std::WindowInfo& window, const WindowControlAssets* controls) {
+void draw_window_frame(ui::Canvas& canvas, const std::WindowInfo& window, const WindowControlAssets* controls) {
     const bool focused = (window.state & std::WindowStateFocused) != 0;
     const bool maximized = (window.state & std::WindowStateMaximized) != 0;
     const int frameX = window.x;
@@ -218,21 +205,25 @@ void draw_window_frame(const RenderBuffer& buffer, const std::WindowInfo& window
     const int innerHeight = totalHeight - (kBorder * 2);
     const int innerRadius = kWindowCornerRadius > kBorder ? (kWindowCornerRadius - kBorder) : 0;
 
-    fill_rounded_rect(buffer, frameX, frameY, totalWidth, totalHeight, kWindowCornerRadius, rgba_from_rgb(focused ? kWindowBorderFocused : kWindowBorder));
-    fill_rounded_rect(buffer, innerX, innerY, innerWidth, innerHeight, innerRadius, rgba_from_rgb(kWindowBackground));
-    fill_top_rounded_rect(buffer, innerX, innerY, innerWidth, kTitleBarHeight - kBorder, innerRadius, rgba_from_rgb(focused ? kTitleBarFocused : kTitleBar));
-    fill_top_rounded_rect(buffer, innerX, innerY, innerWidth, 1, innerRadius, rgba_from_rgb(kTitleBarHighlight));
+    canvas.fill_rounded({ frameX, frameY, totalWidth, totalHeight }, kWindowCornerRadius,
+                        ui::rgb(focused ? kWindowBorderFocused : kWindowBorder));
+    canvas.fill_rounded({ innerX, innerY, innerWidth, innerHeight }, innerRadius, ui::rgb(kWindowBackground));
+    canvas.fill_top_rounded({ innerX, innerY, innerWidth, kTitleBarHeight - kBorder }, innerRadius,
+                            ui::rgb(focused ? kTitleBarFocused : kTitleBar));
+    canvas.fill_top_rounded({ innerX, innerY, innerWidth, 1 }, innerRadius, ui::rgb(kTitleBarHighlight));
 
-    draw_window_control_icon(buffer, window_control_rect(window, 2), 2, maximized, controls);
-    draw_window_control_icon(buffer, window_control_rect(window, 1), 1, maximized, controls);
-    draw_window_control_icon(buffer, window_control_rect(window, 0), 0, maximized, controls);
+    draw_window_control_icon(canvas, window_control_rect(window, 2), 2, maximized, controls);
+    draw_window_control_icon(canvas, window_control_rect(window, 1), 1, maximized, controls);
+    draw_window_control_icon(canvas, window_control_rect(window, 0), 0, maximized, controls);
 
+    const ui::Font& font = ui::Font::ui();
     const char* title = window.title[0] ? window.title : "Window";
-    const int titleWidth = text_width(gUIFont, title);
-    draw_text(buffer, gUIFont, frameX + ((totalWidth - titleWidth) / 2), frameY + 22, title, rgba_from_rgb(kTitleText));
+    canvas.text(frameX + ((totalWidth - font.width(title)) / 2), frameY + 22, title, font, ui::rgb(kTitleText));
 }
 
-void blit_window_surface(const RenderBuffer& buffer, const std::WindowInfo& window, const SurfaceCacheEntry* surfaceEntry) {
+// The window's surface into its content area, opaque. The rows level with
+// the frame's rounded bottom corners are cut to the part inside them.
+void blit_window_surface(ui::Canvas& canvas, const std::WindowInfo& window, const SurfaceCacheEntry* surfaceEntry) {
     if (!surfaceEntry || !surfaceEntry->valid) {
         return;
     }
@@ -245,97 +236,40 @@ void blit_window_surface(const RenderBuffer& buffer, const std::WindowInfo& wind
     const int destX = window.x + kBorder;
     const int destY = window.y + kTitleBarHeight;
     const int innerRadius = kWindowCornerRadius > kBorder ? (kWindowCornerRadius - kBorder) : 0;
-    const int clipBottomBandStart = window.y + frame_height(window) - kBorder - innerRadius;
-    const std::uint32_t sourcePitch = surfaceEntry->info.pitch >= 4
+    const Rect inner = { window.x + kBorder, window.y + kBorder, window.width, frame_height(window) - (kBorder * 2) };
+    const int bandStart = window.y + frame_height(window) - kBorder - innerRadius;
+    const int sourcePitch = static_cast<int>(surfaceEntry->info.pitch >= 4
         ? surfaceEntry->info.pitch / 4
-        : surfaceEntry->info.width;
-    const std::uint32_t copyWidth = surfaceEntry->info.width < static_cast<std::uint32_t>(window.width)
-        ? surfaceEntry->info.width
-        : static_cast<std::uint32_t>(window.width);
-    const std::uint32_t copyHeight = surfaceEntry->info.height < static_cast<std::uint32_t>(window.height)
-        ? surfaceEntry->info.height
-        : static_cast<std::uint32_t>(window.height);
-
-    std::uint32_t sourceStartY = 0;
-    std::uint32_t visibleHeight = copyHeight;
-    int drawStartY = destY;
-    if (drawStartY < 0) {
-        sourceStartY = static_cast<std::uint32_t>(-drawStartY);
-        if (sourceStartY >= visibleHeight) {
-            return;
-        }
-        visibleHeight -= sourceStartY;
-        drawStartY = 0;
-    }
-    if (drawStartY + static_cast<int>(visibleHeight) > static_cast<int>(buffer.height)) {
-        visibleHeight = static_cast<std::uint32_t>(static_cast<int>(buffer.height) - drawStartY);
-    }
-    if (visibleHeight == 0) {
+        : surfaceEntry->info.width);
+    const int copyWidth = static_cast<int>(surfaceEntry->info.width) < window.width
+        ? static_cast<int>(surfaceEntry->info.width) : window.width;
+    const int copyHeight = static_cast<int>(surfaceEntry->info.height) < window.height
+        ? static_cast<int>(surfaceEntry->info.height) : window.height;
+    if (copyWidth <= 0 || copyHeight <= 0) {
         return;
     }
 
-    std::uint32_t sourceStartX = 0;
-    std::uint32_t visibleWidth = copyWidth;
-    int drawStartX = destX;
-    if (drawStartX < 0) {
-        sourceStartX = static_cast<std::uint32_t>(-drawStartX);
-        if (sourceStartX >= visibleWidth) {
-            return;
-        }
-        visibleWidth -= sourceStartX;
-        drawStartX = 0;
-    }
-    if (drawStartX + static_cast<int>(visibleWidth) > static_cast<int>(buffer.width)) {
-        visibleWidth = static_cast<std::uint32_t>(static_cast<int>(buffer.width) - drawStartX);
-    }
-    if (visibleWidth == 0) {
+    const int bandRows = bandStart - destY;
+    if (innerRadius <= 0 || bandRows >= copyHeight) {
+        canvas.copy(src, sourcePitch, { 0, 0, copyWidth, copyHeight }, { destX, destY }, true);
         return;
     }
-
-    if (gDrawClipEnabled) {
-        const Rect visible = { drawStartX, drawStartY, static_cast<int>(visibleWidth), static_cast<int>(visibleHeight) };
-        const Rect clipped = intersect_rect(visible, gDrawClip);
-        if (rect_is_empty(clipped)) {
-            return;
-        }
-        sourceStartX += static_cast<std::uint32_t>(clipped.x - drawStartX);
-        sourceStartY += static_cast<std::uint32_t>(clipped.y - drawStartY);
-        drawStartX = clipped.x;
-        drawStartY = clipped.y;
-        visibleWidth = static_cast<std::uint32_t>(clipped.width);
-        visibleHeight = static_cast<std::uint32_t>(clipped.height);
+    if (bandRows > 0) {
+        canvas.copy(src, sourcePitch, { 0, 0, copyWidth, bandRows }, { destX, destY }, true);
     }
-
-    for (std::uint32_t y = 0; y < visibleHeight; ++y) {
-        const std::uint32_t sourceY = sourceStartY + y;
-        const int drawY = drawStartY + static_cast<int>(y);
-        if (drawY < 0 || drawY >= static_cast<int>(buffer.height)) {
-            continue;
+    const int firstBandRow = bandRows > 0 ? bandRows : 0;
+    for (int row = firstBandRow; row < copyHeight; ++row) {
+        const int y = destY + row;
+        int left = 0;
+        while (left < copyWidth && !ui::in_rounded_rect(inner, innerRadius, destX + left, y)) {
+            ++left;
         }
-
-        if (innerRadius <= 0 || drawY < clipBottomBandStart) {
-            copy_rgb_row_to_texels(
-                &buffer.pixels[drawY * buffer.pitch + static_cast<std::uint32_t>(drawStartX)],
-                &src[sourceY * sourcePitch + sourceStartX],
-                visibleWidth
-            );
-            continue;
+        int right = copyWidth;
+        while (right > left && !ui::in_rounded_rect(inner, innerRadius, destX + right - 1, y)) {
+            --right;
         }
-
-        for (std::uint32_t x = 0; x < visibleWidth; ++x) {
-            const std::uint32_t sourceX = sourceStartX + x;
-            const int drawX = drawStartX + static_cast<int>(x);
-            if (drawX < 0 || drawX >= static_cast<int>(buffer.width)) {
-                continue;
-            }
-            if (innerRadius > 0 &&
-                drawY >= clipBottomBandStart &&
-                !point_in_rounded_rect(drawX, drawY, window.x + kBorder, window.y + kBorder,
-                                       window.width, frame_height(window) - (kBorder * 2), innerRadius)) {
-                continue;
-            }
-
-            buffer.pixels[drawY * buffer.pitch + drawX] = rgb_to_texel_word(src[sourceY * sourcePitch + sourceX]);
+        if (right > left) {
+            canvas.copy(src, sourcePitch, { left, row, right - left, 1 }, { destX + left, y }, true);
         }
     }
 }
@@ -384,7 +318,7 @@ Rect consume_surface_dirty_rect(const std::WindowInfo* windows, std::uint64_t wi
             static_cast<int>(clippedRight - entry->dirtyX),
             static_cast<int>(clippedBottom - entry->dirtyY)
         };
-        dirty = union_rect(dirty, windowDirty);
+        dirty = dirty.unite(windowDirty);
     }
 
     for (std::uint64_t i = 0; i < kMaxSurfaceCache; ++i) {

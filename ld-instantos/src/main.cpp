@@ -87,6 +87,14 @@ Object objects[MAX_OBJECTS];
 u32 objectCount = 0;
 u64 nextLibraryBase = LIBRARY_BASE;
 
+extern "C" void* memset(void* dest, int value, u64 count) {
+    auto* out = static_cast<u8*>(dest);
+    for (u64 i = 0; i < count; i++) {
+        out[i] = static_cast<u8>(value);
+    }
+    return dest;
+}
+
 u64 alignDown(u64 value, u64 alignment) {
     return value & ~(alignment - 1);
 }

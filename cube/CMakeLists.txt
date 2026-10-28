@@ -1,1 +1,1 @@
-add_instant_window_app(cube)
+add_user_app(cube)

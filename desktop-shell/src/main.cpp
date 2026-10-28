@@ -664,32 +664,32 @@ private:
             }
         } else if (event.type == std::EventType::Key && event.key.action == std::KeyEventAction::Press) {
             const bool superPressed = (event.key.modifiers & std::KeyModifierSuper) != 0;
-            const char key = event.key.text[0] != '\0' ? event.key.text[0] : static_cast<char>(event.key.keycode);
-            if (superPressed && (key == 't' || key == 'T')) {
+            const std::uint16_t key = event.key.keycode;
+            if (superPressed && key == std::KeyT) {
                 if (!launch_terminal()) {
                     write_str("[desktop-shell] FAIL spawn terminal\n");
                 }
                 state_.activitySeed += 29U;
                 redraw_ = true;
-            } else if (superPressed && (key == 'f' || key == 'F')) {
+            } else if (superPressed && key == std::KeyF) {
                 if (!launch_file_browser()) {
                     write_str("[desktop-shell] FAIL spawn file-browser\n");
                 }
                 state_.activitySeed += 31U;
                 redraw_ = true;
-            } else if (superPressed && (key == 'b' || key == 'B')) {
+            } else if (superPressed && key == std::KeyB) {
                 if (!launch_background_switcher()) {
                     write_str("[desktop-shell] FAIL spawn background-switcher\n");
                 }
                 state_.activitySeed += 37U;
                 redraw_ = true;
-            } else if (superPressed && (key == 'c' || key == 'C')) {
+            } else if (superPressed && key == std::KeyC) {
                 if (!launch_cube()) {
                     write_str("[desktop-shell] FAIL spawn cube\n");
                 }
                 state_.activitySeed += 41U;
                 redraw_ = true;
-            } else if (superPressed && (key == 'a' || key == 'A')) {
+            } else if (superPressed && key == std::KeyA) {
                 state_.launcherOpen = !state_.launcherOpen;
                 if (state_.launcherOpen) {
                     refresh_launcher_entries(&state_);

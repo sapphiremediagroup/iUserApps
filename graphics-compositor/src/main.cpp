@@ -8,9 +8,6 @@ public:
     GraphicsCompositor& operator=(const GraphicsCompositor&) = delete;
 
     ~GraphicsCompositor() {
-        destroy_ui_font(&gClockTimeFont);
-        destroy_ui_font(&gClockDateFont);
-        destroy_ui_font(&gUIFont);
         delete[] background.pixels;
         if (queue != fail) {
             std::close(queue);
@@ -29,6 +26,7 @@ public:
         initializePointerState();
         initializeAssets();
         renderInitialScene();
+        start_network_watch(queue);
         write_str("[graphics.compositor] ready\n");
         eventLoop();
         return 1;
@@ -40,18 +38,20 @@ private:
     FramebufferView framebuffer = {};
     CompositorBackend* backend = nullptr;
     TripleBufferState buffers = {};
-    RenderBuffer* sceneBuffer = nullptr;
+    ui::Canvas* sceneBuffer = nullptr;
     CursorState cursor = {};
     DragState drag = {};
     std::uint16_t pointerButtons = 0;
     DesktopBackground background = {};
     CursorImage cursorImage = {};
-    ImageAsset taskbarBrand = {};
+    ui::Image taskbarBrand;
     TaskbarStatusAssets taskbarStatus = {};
     WindowControlAssets windowControls = {};
     std::WindowInfo windowSnapshot[kMaxWindows] = {};
     std::uint64_t windowSnapshotCount = 0;
     bool windowSnapshotReady = false;
+    bool shownNetworkOnline = false;
+    PointerRoute pointerRoute = {};
 
     bool initializeService() {
         queue = std::queue_create();
@@ -97,17 +97,13 @@ private:
     }
 
     bool initializeFonts() {
-        gUIFont = {};
-        gClockTimeFont = {};
-        gClockDateFont = {};
-
-        if (!initialize_ui_font(&gUIFont)) {
+        if (!ui::Font::ui().valid()) {
             write_str("[graphics.compositor] ui font load failed, continuing without text\n");
         }
-        if (!initialize_font(&gClockTimeFont, kClockTimeFontPath, kClockTimeFontPixelHeight)) {
+        if (!gClockTimeFont.load(kClockTimeFontPath, kClockTimeFontPixelHeight)) {
             write_str("[graphics.compositor] clock time font load failed, using ui font\n");
         }
-        if (!initialize_font(&gClockDateFont, kClockDateFontPath, kClockDateFontPixelHeight)) {
+        if (!gClockDateFont.load(kClockDateFontPath, kClockDateFontPixelHeight)) {
             write_str("[graphics.compositor] clock date font load failed, using ui font\n");
         }
         return true;
@@ -132,9 +128,9 @@ private:
         if (!cursorImage.loadFromFile(kDefaultCursorPath)) {
             write_str("[graphics.compositor] cursor load failed\n");
         }
-        if (!taskbarBrand.loadFromFile(kTaskbarBrandPath)) {
+        if (!taskbarBrand.load(kTaskbarBrandPath)) {
             write_str("[graphics.compositor] taskbar brand load failed\n");
-        } else if (!taskbarBrand.resizeTo(kTaskbarBrandWidth, kTaskbarBrandHeight)) {
+        } else if (!taskbarBrand.resize(kTaskbarBrandWidth, kTaskbarBrandHeight)) {
             write_str("[graphics.compositor] taskbar brand resize failed\n");
         }
         taskbarStatus.load();
@@ -163,6 +159,10 @@ private:
             }
 
             drainMessages(&fullSceneDirty, &windowDirty);
+            if (gNetworkOnline != shownNetworkOnline) {
+                shownNetworkOnline = gNetworkOnline;
+                fullSceneDirty = true;
+            }
 
             if (pumpSurfaceUpdatesOnce()) {
                 surfaceDirty = true;
@@ -178,10 +178,10 @@ private:
 
             if (surfaceDirty) {
                 const Rect dirty = consume_surface_dirty_rect(windowSnapshot, windowSnapshotCount, gSurfaceCache, fbInfo.width, fbInfo.height);
-                windowDirty = union_rect(windowDirty, dirty);
+                windowDirty = windowDirty.unite(dirty);
             }
 
-            if (!rect_is_empty(windowDirty)) {
+            if (!windowDirty.empty()) {
                 redrawDirtyRect(windowDirty);
             }
         }
@@ -215,6 +215,10 @@ private:
             }
         }
 
+        if (changed) {
+            logNewWindows(current, count);
+            forget_unshown_surfaces(gSurfaceCache, current, count);
+        }
         std::memset(windowSnapshot, 0, sizeof(windowSnapshot));
         for (std::uint64_t i = 0; i < count && i < kMaxWindows; ++i) {
             windowSnapshot[i] = current[i];
@@ -222,6 +226,35 @@ private:
         windowSnapshotCount = count;
         windowSnapshotReady = true;
         return changed;
+    }
+
+    // One serial line per window that was not there before: where it opened
+    // (the content area starts kBorder right of x and kTitleBarHeight below y).
+    void logNewWindows(const std::WindowInfo* current, std::uint64_t count) {
+        for (std::uint64_t i = 0; i < count && i < kMaxWindows; ++i) {
+            bool known = false;
+            for (std::uint64_t j = 0; j < windowSnapshotCount && !known; ++j) {
+                known = windowSnapshot[j].id == current[i].id;
+            }
+            if (known || current[i].x < 0 || current[i].y < 0) {
+                continue;
+            }
+            char title[sizeof(current[i].title) + 1] = {};
+            std::memcpy(title, current[i].title, sizeof(current[i].title));
+            write_str("[graphics.compositor] window id=");
+            write_u64(current[i].id);
+            write_str(" x=");
+            write_u64(static_cast<std::uint64_t>(current[i].x));
+            write_str(" y=");
+            write_u64(static_cast<std::uint64_t>(current[i].y));
+            write_str(" w=");
+            write_u64(static_cast<std::uint64_t>(current[i].width));
+            write_str(" h=");
+            write_u64(static_cast<std::uint64_t>(current[i].height));
+            write_str(" title=");
+            write_str(title);
+            write_str("\n");
+        }
     }
 
     bool pumpSurfaceUpdatesOnce() {
@@ -266,11 +299,13 @@ private:
     }
 
     void handlePointerEventMessage(const std::Event& event, bool* fullSceneDirty, Rect* windowDirty) {
+        // Before our own handling, which may start a drag from this press.
+        route_pointer_to_window(event, windowSnapshot, windowSnapshotCount, fbInfo.width, fbInfo.height, drag, &pointerRoute);
         const CursorState previousCursor = cursor;
         move_cursor(framebuffer, &cursor, event.pointer.x, event.pointer.y);
         if (handle_pointer_event(event, windowSnapshot, windowSnapshotCount, fbInfo.width, fbInfo.height, &drag, &pointerButtons, windowDirty)) {
             *fullSceneDirty = true;
-        } else if (!*fullSceneDirty && (!windowDirty || rect_is_empty(*windowDirty)) &&
+        } else if (!*fullSceneDirty && (!windowDirty || windowDirty->empty()) &&
                    (previousCursor.x != cursor.x || previousCursor.y != cursor.y)) {
             backend->presentCursorMove(*sceneBuffer, previousCursor, cursor, cursorImage);
         }
@@ -282,22 +317,26 @@ private:
             return;
         }
 
-        const char key = event.key.text[0] != '\0' ? event.key.text[0] : static_cast<char>(event.key.keycode);
-        if (key == 't' || key == 'T') {
+        const std::uint16_t key = event.key.keycode;
+        if (key == std::KeyT) {
             if (!launch_terminal()) {
                 write_str("[graphics.compositor] FAIL spawn terminal\n");
             }
-        } else if (key == 'f' || key == 'F') {
+        } else if (key == std::KeyF) {
             if (!launch_file_browser()) {
                 write_str("[graphics.compositor] FAIL spawn file-browser\n");
             }
-        } else if (key == 'b' || key == 'B') {
+        } else if (key == std::KeyB) {
             if (!launch_background_switcher()) {
                 write_str("[graphics.compositor] FAIL spawn background-switcher\n");
             }
-        } else if (key == 'c' || key == 'C') {
+        } else if (key == std::KeyC) {
             if (!launch_cube()) {
                 write_str("[graphics.compositor] FAIL spawn cube\n");
+            }
+        } else if (key == std::KeyW) {
+            if (!launch_browser()) {
+                write_str("[graphics.compositor] FAIL spawn netsurf\n");
             }
         }
     }
@@ -352,7 +391,7 @@ private:
 
     void redrawDirtyRect(Rect windowDirty) {
         windowDirty = clamp_rect(windowDirty, fbInfo.width, fbInfo.height);
-        if (rect_is_empty(windowDirty)) {
+        if (windowDirty.empty()) {
             return;
         }
 

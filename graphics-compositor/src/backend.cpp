@@ -19,19 +19,19 @@ public:
         return target_.pixels != nullptr;
     }
 
-    void presentFull(const RenderBuffer& scene, const CursorState& cursor,
+    void presentFull(const ui::Canvas& scene, const CursorState& cursor,
                      const CursorImage& cursorImage) override {
         present_to_framebuffer(scene, target_);
         present_cursor_move(scene, target_, cursor, cursor, cursorImage);
     }
 
-    void presentRect(const RenderBuffer& scene, const Rect& rect,
+    void presentRect(const ui::Canvas& scene, const Rect& rect,
                      const CursorState& cursor, const CursorImage& cursorImage) override {
         present_rect_to_framebuffer(scene, target_, rect);
         present_cursor_move(scene, target_, cursor, cursor, cursorImage);
     }
 
-    void presentCursorMove(const RenderBuffer& scene, const CursorState& oldCursor,
+    void presentCursorMove(const ui::Canvas& scene, const CursorState& oldCursor,
                            const CursorState& newCursor, const CursorImage& cursorImage) override {
         present_cursor_move(scene, target_, oldCursor, newCursor, cursorImage);
     }
@@ -94,19 +94,19 @@ public:
 
     // Until GPU compositing lands, presentation reuses the software path so the
     // output is pixel-identical and never regresses.
-    void presentFull(const RenderBuffer& scene, const CursorState& cursor,
+    void presentFull(const ui::Canvas& scene, const CursorState& cursor,
                      const CursorImage& cursorImage) override {
         present_to_framebuffer(scene, target_);
         present_cursor_move(scene, target_, cursor, cursor, cursorImage);
     }
 
-    void presentRect(const RenderBuffer& scene, const Rect& rect,
+    void presentRect(const ui::Canvas& scene, const Rect& rect,
                      const CursorState& cursor, const CursorImage& cursorImage) override {
         present_rect_to_framebuffer(scene, target_, rect);
         present_cursor_move(scene, target_, cursor, cursor, cursorImage);
     }
 
-    void presentCursorMove(const RenderBuffer& scene, const CursorState& oldCursor,
+    void presentCursorMove(const ui::Canvas& scene, const CursorState& oldCursor,
                            const CursorState& newCursor, const CursorImage& cursorImage) override {
         present_cursor_move(scene, target_, oldCursor, newCursor, cursorImage);
     }

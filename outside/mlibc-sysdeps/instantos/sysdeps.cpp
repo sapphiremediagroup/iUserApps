@@ -4,6 +4,7 @@
 #include <mlibc/all-sysdeps.hpp>
 #include <mlibc/debug.hpp>
 #include <mlibc/tcb.hpp>
+#include <mlibc/allocator.hpp>
 #include <string.h>
 #include <time.h>
 #include <stdarg.h>
@@ -17,6 +18,8 @@
 #include <sys/resource.h>
 #include <sys/times.h>
 #include <sys/socket.h>
+#include <sys/time.h>
+#include <netinet/in.h>
 #include <poll.h>
 #include <sys/utsname.h>
 #include <unistd.h>
@@ -893,9 +896,12 @@ int Sysdeps<Sysconf>::operator()(int number, long* result) {
             *result = 1024;
             return 0;
         case _SC_NPROCESSORS_CONF:
-        case _SC_NPROCESSORS_ONLN:
-            *result = 1;
+        case _SC_NPROCESSORS_ONLN: {
+            // Every CPU the kernel brought up is online.
+            long ret = __do_syscall2(INSTANTOS_SYS_CPU_INFO, 0, 0);
+            *result = ret > 0 ? ret : 1;
             return 0;
+        }
         case _SC_PHYS_PAGES:
         case _SC_AVPHYS_PAGES: {
             instantos_os_info info {};
@@ -926,10 +932,26 @@ int Sysdeps<ClockGet>::operator()(int clock, time_t* secs, long* nanos) {
     constexpr int kClockMonotonicRaw = 4;
     constexpr int kClockBoottime = 7;
     if (clock == kClockMonotonic || clock == kClockMonotonicRaw || clock == kClockBoottime) {
+        // Nanoseconds from the TSC (GetTimeNs); ms from the tick counter on
+        // a kernel without it.
+        long ns = __do_syscall0(INSTANTOS_SYS_GETTIME_NS);
+        if (sc_error(ns) == 0) {
+            *secs = ns / 1000000000L;
+            *nanos = ns % 1000000000L;
+            return 0;
+        }
         long ms = __do_syscall0(INSTANTOS_SYS_GETTIME);
         if (int e = sc_error(ms); e) return e;
         *secs = ms / 1000;
         *nanos = (ms % 1000) * 1000000;
+        return 0;
+    }
+    // The wall clock in nanoseconds; kernels without GetUnixTimeNs fall back
+    // to the derivation below.
+    long unixns = __do_syscall0(INSTANTOS_SYS_GETUNIXTIME_NS);
+    if (sc_error(unixns) == 0) {
+        *secs = unixns / 1000000000L;
+        *nanos = unixns % 1000000000L;
         return 0;
     }
     // Provide sub-second (millisecond) precision for the wall clock. The kernel
@@ -948,6 +970,18 @@ int Sysdeps<ClockGet>::operator()(int clock, time_t* secs, long* nanos) {
     *secs = unixt;
     *nanos = (sc_error(ms) == 0) ? (ms % 1000) * 1000000 : 0;
     return 0;
+}
+
+int Sysdeps<SetItimer>::operator()(int which, const struct itimerval* new_value,
+                                   struct itimerval* old_value) {
+    long ret = __do_syscall3(INSTANTOS_SYS_SETITIMER, which, reinterpret_cast<long>(new_value),
+                             reinterpret_cast<long>(old_value));
+    return sc_error(ret);
+}
+
+int Sysdeps<GetItimer>::operator()(int which, struct itimerval* value) {
+    long ret = __do_syscall2(INSTANTOS_SYS_GETITIMER, which, reinterpret_cast<long>(value));
+    return sc_error(ret);
 }
 
 void Sysdeps<Yield>::operator()() {
@@ -1462,10 +1496,11 @@ int Sysdeps<Times>::operator()(struct tms* tms, clock_t* out) {
     return 0;
 }
 
-int Sysdeps<ClockSet>::operator()(int /*clock*/, time_t /*secs*/, long /*nanos*/) {
-    // The RTC is not settable from here; accept as a no-op so `date -s` does
-    // not hard-fail. (The wall clock is unchanged.)
-    return 0;
+int Sysdeps<ClockSet>::operator()(int clock, time_t secs, long nanos) {
+    // Only CLOCK_REALTIME can be set (root only); the RTC itself is left alone.
+    if (clock != 0 || secs < 0 || nanos < 0 || nanos >= 1000000000L) return EINVAL;
+    long ret = __do_syscall1(INSTANTOS_SYS_SETUNIXTIME, secs * 1000000000L + nanos);
+    return sc_error(ret);
 }
 
 int Sysdeps<ClockGetres>::operator()(int /*clock*/, time_t* secs, long* nanos) {
@@ -1756,8 +1791,54 @@ int Sysdeps<Ttyname>::operator()(int fd, char* buf, size_t size) {
 // is a verbatim Linux `struct sockaddr_in` (AF_INET == 2, port and address in
 // network byte order), so addresses pass through untouched.
 //
-// The kernel send/recv only operate on a single flat buffer; we implement the
-// scatter/gather MsgSend/MsgRecv on top of per-iovec send/recv calls.
+// The kernel send/recv/sendto/recvfrom operate on a single flat buffer. For
+// streams MsgSend/MsgRecv loop over the iovecs; a datagram must stay one
+// datagram, so it is gathered into (or scattered from) a bounce buffer.
+
+namespace {
+
+bool socket_is_datagram(long handle) {
+    int type = 0;
+    socklen_t len = sizeof(type);
+    long g = __do_syscall5(INSTANTOS_SYS_GETSOCKOPT, handle, SOL_SOCKET, SO_TYPE,
+                           reinterpret_cast<long>(&type), reinterpret_cast<long>(&len));
+    return sc_error(g) == 0 && type == SOCK_DGRAM;
+}
+
+// One send of `size` bytes, to `dest` if given (sendto) or the connected peer.
+long socket_send_one(long handle, const void* buffer, size_t size, int flags,
+                     const struct sockaddr* dest, socklen_t dest_length) {
+    if (dest != nullptr && dest_length != 0) {
+        return __do_syscall5(INSTANTOS_SYS_SENDTO, handle, reinterpret_cast<long>(buffer),
+                             static_cast<long>(size), static_cast<long>(flags),
+                             reinterpret_cast<long>(dest));
+    }
+    return __do_syscall4(INSTANTOS_SYS_SEND, handle, reinterpret_cast<long>(buffer),
+                         static_cast<long>(size), static_cast<long>(flags));
+}
+
+// One recv; the source address (a sockaddr_in) is stored to `from` when
+// asked for, with its length capped by *from_length.
+long socket_recv_one(long handle, void* buffer, size_t size, int flags,
+                     struct sockaddr* from, socklen_t* from_length) {
+    if (from == nullptr || from_length == nullptr) {
+        return __do_syscall4(INSTANTOS_SYS_RECV, handle, reinterpret_cast<long>(buffer),
+                             static_cast<long>(size), static_cast<long>(flags));
+    }
+    struct sockaddr_in source;
+    memset(&source, 0, sizeof(source));
+    long ret = __do_syscall5(INSTANTOS_SYS_RECVFROM, handle, reinterpret_cast<long>(buffer),
+                             static_cast<long>(size), static_cast<long>(flags),
+                             reinterpret_cast<long>(&source));
+    if (sc_error(ret) == 0) {
+        socklen_t n = *from_length < sizeof(source) ? *from_length : sizeof(source);
+        memcpy(from, &source, n);
+        *from_length = sizeof(source);
+    }
+    return ret;
+}
+
+}  // namespace
 
 int Sysdeps<Socket>::operator()(int family, int type, int protocol, int* fd) {
     long ret = __do_syscall3(INSTANTOS_SYS_SOCKET,
@@ -1872,21 +1953,7 @@ int Sysdeps<Sendto>::operator()(int fd, const void* buffer, size_t size, int fla
                                 ssize_t* length) {
     long handle = handle_for_fd(fd);
     if (handle < 0) return EBADF;
-
-    // For a connectionless datagram socket the destination is supplied per
-    // call; the kernel has no separate sendto, so connect() the peer first
-    // (matches the native ilibcxx sendto behaviour).
-    if (sock_addr != nullptr) {
-        long c = __do_syscall3(INSTANTOS_SYS_CONNECT, handle,
-                               reinterpret_cast<long>(sock_addr),
-                               static_cast<long>(addr_length));
-        if (int e = sc_error(c); e && e != EAGAIN) return e;
-    }
-
-    long ret = __do_syscall4(INSTANTOS_SYS_SEND, handle,
-                             reinterpret_cast<long>(buffer),
-                             static_cast<long>(size),
-                             static_cast<long>(flags));
+    long ret = socket_send_one(handle, buffer, size, flags, sock_addr, addr_length);
     if (int e = sc_error(ret); e) return e;
     if (length) *length = ret;
     return 0;
@@ -1897,29 +1964,37 @@ int Sysdeps<Recvfrom>::operator()(int fd, void* buffer, size_t size, int flags,
                                   ssize_t* length) {
     long handle = handle_for_fd(fd);
     if (handle < 0) return EBADF;
-
-    long ret = __do_syscall4(INSTANTOS_SYS_RECV, handle,
-                             reinterpret_cast<long>(buffer),
-                             static_cast<long>(size),
-                             static_cast<long>(flags));
+    long ret = socket_recv_one(handle, buffer, size, flags, sock_addr, addr_length);
     if (int e = sc_error(ret); e) return e;
     if (length) *length = ret;
-    // The kernel recv does not report the source address; signal "none".
-    (void)sock_addr;
-    if (addr_length) *addr_length = 0;
     return 0;
 }
 
 int Sysdeps<MsgSend>::operator()(int fd, const struct msghdr* hdr, int flags, ssize_t* length) {
     long handle = handle_for_fd(fd);
     if (handle < 0) return EBADF;
+    const auto* dest = static_cast<const struct sockaddr*>(hdr->msg_name);
 
-    // Optional per-message destination address (datagram sockets).
-    if (hdr->msg_name != nullptr && hdr->msg_namelen != 0) {
-        long c = __do_syscall3(INSTANTOS_SYS_CONNECT, handle,
-                               reinterpret_cast<long>(hdr->msg_name),
-                               static_cast<long>(hdr->msg_namelen));
-        if (int e = sc_error(c); e && e != EAGAIN) return e;
+    if (socket_is_datagram(handle)) {
+        size_t size = 0;
+        for (int i = 0; i < hdr->msg_iovlen; ++i) size += hdr->msg_iov[i].iov_len;
+        const void* data = hdr->msg_iovlen == 1 ? hdr->msg_iov[0].iov_base : nullptr;
+        char* bounce = nullptr;
+        if (!data && size != 0) {
+            bounce = static_cast<char*>(getAllocator().allocate(size));
+            if (!bounce) return ENOMEM;
+            size_t off = 0;
+            for (int i = 0; i < hdr->msg_iovlen; ++i) {
+                memcpy(bounce + off, hdr->msg_iov[i].iov_base, hdr->msg_iov[i].iov_len);
+                off += hdr->msg_iov[i].iov_len;
+            }
+            data = bounce;
+        }
+        long ret = socket_send_one(handle, data, size, flags, dest, hdr->msg_namelen);
+        if (bounce) getAllocator().free(bounce);
+        if (int e = sc_error(ret); e) return e;
+        if (length) *length = ret;
+        return 0;
     }
 
     ssize_t total = 0;
@@ -1944,6 +2019,41 @@ int Sysdeps<MsgSend>::operator()(int fd, const struct msghdr* hdr, int flags, ss
 int Sysdeps<MsgRecv>::operator()(int fd, struct msghdr* hdr, int flags, ssize_t* length) {
     long handle = handle_for_fd(fd);
     if (handle < 0) return EBADF;
+
+    if (socket_is_datagram(handle)) {
+        size_t size = 0;
+        for (int i = 0; i < hdr->msg_iovlen; ++i) size += hdr->msg_iov[i].iov_len;
+        char* bounce = nullptr;
+        void* target = hdr->msg_iovlen == 1 ? hdr->msg_iov[0].iov_base : nullptr;
+        if (!target) {
+            bounce = static_cast<char*>(getAllocator().allocate(size ? size : 1));
+            if (!bounce) return ENOMEM;
+            target = bounce;
+        }
+        socklen_t namelen = hdr->msg_namelen;
+        long ret = socket_recv_one(handle, target, size, flags,
+                                   static_cast<struct sockaddr*>(hdr->msg_name),
+                                   hdr->msg_name ? &namelen : nullptr);
+        if (int e = sc_error(ret); e) {
+            if (bounce) getAllocator().free(bounce);
+            return e;
+        }
+        if (bounce) {
+            size_t off = 0;
+            for (int i = 0; i < hdr->msg_iovlen && off < static_cast<size_t>(ret); ++i) {
+                size_t n = hdr->msg_iov[i].iov_len;
+                if (n > static_cast<size_t>(ret) - off) n = static_cast<size_t>(ret) - off;
+                memcpy(hdr->msg_iov[i].iov_base, bounce + off, n);
+                off += n;
+            }
+            getAllocator().free(bounce);
+        }
+        hdr->msg_namelen = hdr->msg_name ? namelen : 0;
+        hdr->msg_controllen = 0;
+        hdr->msg_flags = 0;
+        if (length) *length = ret;
+        return 0;
+    }
 
     ssize_t total = 0;
     for (int i = 0; i < hdr->msg_iovlen; ++i) {

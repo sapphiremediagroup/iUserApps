@@ -21,6 +21,9 @@ static void serial_write(const char* text) {
 int main(int argc, char** argv) {
     serial_write("mlibc-hello: serial-start\n");
     printf("mlibc-hello: argc=%d argv0=%s pid=%d\n", argc, argv && argv[0] ? argv[0] : "<none>", getpid());
+    char line[64];
+    snprintf(line, sizeof(line), "mlibc-hello: nprocs=%ld\n", sysconf(_SC_NPROCESSORS_ONLN));
+    serial_write(line);
     serial_write("mlibc-hello: serial-done\n");
     return 0;
 }

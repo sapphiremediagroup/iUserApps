@@ -612,21 +612,16 @@ bool open_selected_entry(BrowserState* state) {
     return true;
 }
 
-char translate_key(const std::Event& event) {
-    if (event.type != std::EventType::Key || event.key.action != std::KeyEventAction::Press) {
-        return 0;
+// The key a press or repeat is for, KeyNone for releases and for Ctrl/Alt/
+// Super combinations (Super+F and the like are the desktop's).
+std::uint16_t pressed_key(const std::Event& event) {
+    if (event.type != std::EventType::Key || event.key.action == std::KeyEventAction::Release) {
+        return std::KeyNone;
     }
-
-    if (event.key.keycode == '\r') {
-        return '\n';
+    if ((event.key.modifiers & (std::KeyModifierControl | std::KeyModifierAlt | std::KeyModifierSuper)) != 0) {
+        return std::KeyNone;
     }
-    if (event.key.text[0] != '\0') {
-        return event.key.text[0];
-    }
-    if (event.key.keycode == '\n' || event.key.keycode == '\b') {
-        return static_cast<char>(event.key.keycode);
-    }
-    return 0;
+    return event.key.keycode;
 }
 
 std::uint32_t entry_color(const BrowserEntry& entry) {
@@ -798,28 +793,36 @@ private:
             return state_->running;
         }
 
-        const char key = translate_key(event);
-        if (key == 0) {
-            return true;
-        }
-
-        const char lowered = ascii_lower(key);
-        if (key == '\b') {
+        const std::uint16_t key = pressed_key(event);
+        const int page = static_cast<int>(visibleRows_);
+        if (key == std::KeyBackspace) {
             open_parent_directory(state_);
             dirty_ = true;
-        } else if (key == '\n') {
+        } else if (key == std::KeyEnter || key == std::KeypadEnter) {
             open_selected_entry(state_);
             dirty_ = true;
-        } else if (lowered == 'j' || lowered == 's') {
+        } else if (key == std::KeyDown || key == std::KeyJ || key == std::KeyS) {
             move_selection(state_, 1, visibleRows_);
             dirty_ = true;
-        } else if (lowered == 'k' || lowered == 'w') {
+        } else if (key == std::KeyUp || key == std::KeyK || key == std::KeyW) {
             move_selection(state_, -1, visibleRows_);
             dirty_ = true;
-        } else if (lowered == 'r') {
+        } else if (key == std::KeyPageDown) {
+            move_selection(state_, page, visibleRows_);
+            dirty_ = true;
+        } else if (key == std::KeyPageUp) {
+            move_selection(state_, -page, visibleRows_);
+            dirty_ = true;
+        } else if (key == std::KeyHome) {
+            move_selection(state_, -static_cast<int>(state_->entryCount), visibleRows_);
+            dirty_ = true;
+        } else if (key == std::KeyEnd) {
+            move_selection(state_, static_cast<int>(state_->entryCount), visibleRows_);
+            dirty_ = true;
+        } else if (key == std::KeyR) {
             load_directory(state_);
             dirty_ = true;
-        } else if (lowered == 'q') {
+        } else if (key == std::KeyQ || key == std::KeyEscape) {
             state_->running = false;
             close();
             return false;

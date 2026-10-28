@@ -117,6 +117,8 @@ struct InstantosSysdepTags :
 	Sigaction,
 	Sigprocmask,
 	Sleep,
+	SetItimer,
+	GetItimer,
 	Yield,
 	Times,
 	Uname,

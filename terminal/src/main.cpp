@@ -325,48 +325,102 @@ void draw_terminal(std::uint32_t* px, std::uint32_t pitch, std::uint32_t W, std:
 
 // ---- input ----------------------------------------------------------------
 
+// The xterm sequence a key sends, or nullptr for keys that are not one.
+const char* key_sequence(std::uint16_t code) {
+    switch (code) {
+        case std::KeyUp: return "\x1b[A";
+        case std::KeyDown: return "\x1b[B";
+        case std::KeyRight: return "\x1b[C";
+        case std::KeyLeft: return "\x1b[D";
+        case std::KeyHome: return "\x1b[H";
+        case std::KeyEnd: return "\x1b[F";
+        case std::KeyInsert: return "\x1b[2~";
+        case std::KeyDelete: return "\x1b[3~";
+        case std::KeyPageUp: return "\x1b[5~";
+        case std::KeyPageDown: return "\x1b[6~";
+        case std::KeyF1: return "\x1bOP";
+        case std::KeyF2: return "\x1bOQ";
+        case std::KeyF3: return "\x1bOR";
+        case std::KeyF4: return "\x1bOS";
+        case std::KeyF5: return "\x1b[15~";
+        case std::KeyF6: return "\x1b[17~";
+        case std::KeyF7: return "\x1b[18~";
+        case std::KeyF8: return "\x1b[19~";
+        case std::KeyF9: return "\x1b[20~";
+        case std::KeyF10: return "\x1b[21~";
+        case std::KeyF11: return "\x1b[23~";
+        case std::KeyF12: return "\x1b[24~";
+        default: return nullptr;
+    }
+}
+
 // Translate a key event into bytes to write to the PTY master. Returns the
 // number of bytes written into out (up to 8), or 0 if the key is ignored.
 int translate_key(const std::Event& event, char* out) {
-    if (event.type != std::EventType::Key || event.key.action != std::KeyEventAction::Press) {
+    if (event.type != std::EventType::Key || event.key.action == std::KeyEventAction::Release) {
+        return 0;
+    }
+
+    // Super combinations are the desktop's shortcuts (Super+T, ...).
+    if ((event.key.modifiers & std::KeyModifierSuper) != 0) {
         return 0;
     }
 
     const std::uint16_t code = event.key.keycode;
     const bool ctrl = (event.key.modifiers & std::KeyModifierControl) != 0;
+    const bool alt = (event.key.modifiers & std::KeyModifierAlt) != 0;
 
-    // Arrow keys / navigation -> escape sequences (keycodes are app-specific;
-    // we map the common values used by the input manager).
+    if (const char* sequence = key_sequence(code)) {
+        int n = 0;
+        while (sequence[n] != '\0') { out[n] = sequence[n]; ++n; }
+        // Modifiers go in as xterm's parameter, 1 + Shift 1, Alt 2, Ctrl 4:
+        // ESC [ A becomes ESC [ 1 ; 5 A, ESC O P ESC [ 1 ; 5 P, ESC [ 3 ~
+        // ESC [ 3 ; 5 ~ (the kernel's console does the same).
+        const bool shift = (event.key.modifiers & std::KeyModifierShift) != 0;
+        const char param = (char)('1' + (shift ? 1 : 0) + (alt ? 2 : 0) + (ctrl ? 4 : 0));
+        if (param != '1') {
+            const char final = out[n - 1];
+            n = (final == '~') ? n - 1 : 2;
+            out[1] = '[';
+            if (final != '~') { out[n++] = '1'; }
+            out[n++] = ';';
+            out[n++] = param;
+            out[n++] = final;
+        }
+        return n;
+    }
+
+    // Alt sends ESC before the key, as xterm's metaSendsEscape.
+    int n = 0;
+    if (alt) { out[n++] = 0x1B; }
+
     switch (code) {
-        case 0x4B: out[0]=0x1B; out[1]='['; out[2]='D'; return 3; // left
-        case 0x4D: out[0]=0x1B; out[1]='['; out[2]='C'; return 3; // right
-        case 0x48: out[0]=0x1B; out[1]='['; out[2]='A'; return 3; // up
-        case 0x50: out[0]=0x1B; out[1]='['; out[2]='B'; return 3; // down
+        case std::KeyEnter: case std::KeypadEnter: out[n++] = '\n'; return n;
+        case std::KeyBackspace: out[n++] = 0x7F; return n;   // DEL, as xterm
+        case std::KeyTab: out[n++] = '\t'; return n;
+        case std::KeyEscape: out[n++] = 0x1B; return n;
         default: break;
     }
 
-    if (code == '\r') { out[0] = '\r'; return 1; }
-    if (code == '\b') { out[0] = 0x7F; return 1; }   // DEL for backspace
-    if (code == '\t') { out[0] = '\t'; return 1; }
-    if (code == 0x1B) { out[0] = 0x1B; return 1; }
-
-    char ch = event.key.text[0];
+    const char ch = event.key.text[0];
+    if (ctrl) {
+        // Ctrl-A..Ctrl-Z -> 1..26, plus the other C0 controls on their keys.
+        if (code >= std::KeyA && code <= std::KeyZ) { out[n++] = (char)(code - std::KeyA + 1); return n; }
+        switch (code) {
+            case std::KeySpace: case std::Key2: out[n++] = 0x00; return n;     // Ctrl-@
+            case std::KeyLeftBracket: out[n++] = 0x1B; return n;               // Ctrl-[
+            case std::KeyBackslash: out[n++] = 0x1C; return n;                 // Ctrl-backslash
+            case std::KeyRightBracket: out[n++] = 0x1D; return n;              // Ctrl-]
+            case std::Key6: out[n++] = 0x1E; return n;                         // Ctrl-^
+            case std::KeyMinus: case std::KeySlash: out[n++] = 0x1F; return n; // Ctrl-_
+            default: break;
+        }
+    }
     if (ch == '\0') {
-        if (code == '\n' || code == '\t') { out[0] = (char)code; return 1; }
         return 0;
     }
-
-    if (ctrl) {
-        // Ctrl-A..Ctrl-Z -> 1..26, plus a few common controls.
-        char lower = ch;
-        if (lower >= 'A' && lower <= 'Z') lower = (char)(lower - 'A' + 'a');
-        if (lower >= 'a' && lower <= 'z') { out[0] = (char)(lower - 'a' + 1); return 1; }
-        if (ch == '[') { out[0] = 0x1B; return 1; }
-        if (ch == '\\') { out[0] = 0x1C; return 1; }
-    }
-
-    out[0] = ch;
-    return 1;
+    out[n++] = ch;
+    return n;
 }
 
 // ---- shell spawning --------------------------------------------------------
@@ -467,6 +521,12 @@ private:
 
         t_->childPid = spawn_shell(slave);
         std::close(slave);
+        // The shell is the terminal's foreground job (each process is its own
+        // group here): bash with job control waits until it is.
+        if (t_->childPid != fail) {
+            std::uint32_t pgrp = static_cast<std::uint32_t>(t_->childPid);
+            std::ioctl(master, std::TIOCSPGRP, reinterpret_cast<std::uint64_t>(&pgrp));
+        }
         // Restore our own stdio slots to avoid keeping the slave bound here.
         return t_->childPid != fail;
     }
