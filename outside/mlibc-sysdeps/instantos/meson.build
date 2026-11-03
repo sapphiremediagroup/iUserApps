@@ -13,6 +13,7 @@ rtld_include_dirs += include_directories('include')
 libc_sources += files(
   'builtins.c',
   'entry.cpp',
+  'inline-emitter.cpp',
   'syscall.cpp',
   'sysdeps.cpp',
 )
@@ -66,6 +67,17 @@ if not no_headers
     '../../abis/linux/utmp-defines.h',
     subdir: 'abi-bits',
     follow_symlinks: true,
+  )
+  # major/minor/makedev (Linux's encoding), as ironclad's and zinnia's sysdeps
+  # ship it: the linux option that carries it is off. libdrm needs it.
+  install_headers(
+    'include/sys/sysmacros.h',
+    subdir: 'sys',
+  )
+  # Windows and GPU-buffer surfaces for mlibc programs (Mesa's EGL platform).
+  install_headers(
+    'include/instantos/window.h',
+    subdir: 'instantos',
   )
 endif
 

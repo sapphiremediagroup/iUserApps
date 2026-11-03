@@ -4,42 +4,40 @@
 //   * Opens /dev/ptmx to obtain a PTY master, reads the slave index via
 //     TIOCGPTN, and binds the slave (/dev/pts/N) to fds 0/1/2 before spawning
 //     a shell so the child gets a real controlling terminal.
-//   * Reads bytes from the master, feeds them through an ANSI/VT parser into a
-//     character-cell grid, and renders the grid to the window surface.
+//   * The window loop watches the master: whatever the shell writes is fed
+//     through an ANSI/VT parser into a character-cell grid, and the rows it
+//     changed are repainted.
 //   * Forwards keystrokes (translating special keys to escape sequences) to the
 //     master fd, where the kernel line discipline cooks them for the shell.
+//   * A resize recomputes the grid and tells the shell (TIOCSWINSZ).
 
 #include <cstdint.hpp>
 #include <cstring.hpp>
 #include <fcntl.h>
-#include <instant/font.hpp>
-#include <instant/window.hpp>
-#include <new.hpp>
 #include <syscall.hpp>
+#include <ui/window.hpp>
 
 namespace {
 constexpr std::uint64_t fail = static_cast<std::uint64_t>(-1);
-constexpr std::uint32_t kSurfaceWidth = 920;
-constexpr std::uint32_t kSurfaceHeight = 560;
-constexpr std::uint32_t kFrameIntervalMs = 16;
-constexpr std::uint32_t kCursorBlinkMs = 500;
+constexpr int kCursorBlinkMs = 500;
 constexpr int kPaddingX = 12;
 constexpr int kPaddingY = 12;
 constexpr std::uint32_t kFontPixelHeight = 15;
+constexpr char kFontPath[] = "/bin/JetBrainsMono-Regular.ttf";
 
-constexpr std::uint32_t kMaxRows = 60;
-constexpr std::uint32_t kMaxCols = 200;
+constexpr std::uint32_t kMaxRows = 120;
+constexpr std::uint32_t kMaxCols = 300;
 
-constexpr std::uint32_t kColorBackground = 0x00091218U;
-constexpr std::uint32_t kColorDefaultFg = 0x00d7f2e6U;
-constexpr std::uint32_t kColorCursor = 0x00f2c14eU;
+constexpr ui::Color kColorBackground = ui::rgb(0x091218);
+constexpr ui::Color kColorDefaultFg = ui::rgb(0xd7f2e6);
+constexpr ui::Color kColorCursor = ui::rgb(0xf2c14e);
 
-// The 8 ANSI base colors and their bright variants (0x00RRGGBB).
-constexpr std::uint32_t kAnsiColors[16] = {
-    0x00101010, 0x00cc5555, 0x0066bb66, 0x00cccc66,
-    0x005588cc, 0x00bb66bb, 0x0066bbbb, 0x00d7f2e6,
-    0x00505050, 0x00ef798a, 0x0085d39a, 0x00f2c14e,
-    0x003ba4d8, 0x00c98ad8, 0x0066cccc, 0x00ffffff,
+// The 8 ANSI base colors and their bright variants.
+constexpr ui::Color kAnsiColors[16] = {
+    ui::rgb(0x101010), ui::rgb(0xcc5555), ui::rgb(0x66bb66), ui::rgb(0xcccc66),
+    ui::rgb(0x5588cc), ui::rgb(0xbb66bb), ui::rgb(0x66bbbb), ui::rgb(0xd7f2e6),
+    ui::rgb(0x505050), ui::rgb(0xef798a), ui::rgb(0x85d39a), ui::rgb(0xf2c14e),
+    ui::rgb(0x3ba4d8), ui::rgb(0xc98ad8), ui::rgb(0x66cccc), ui::rgb(0xffffff),
 };
 
 // Encoded kernel File handle for a stdio slot: (HandleType::File << 48) | slot.
@@ -51,8 +49,8 @@ constexpr std::uint64_t stdio_handle(int slot) {
 
 struct Cell {
     char ch;
-    std::uint32_t fg;
-    std::uint32_t bg;
+    ui::Color fg;
+    ui::Color bg;
 };
 
 struct VTParser {
@@ -63,26 +61,39 @@ struct VTParser {
     bool paramStarted;
 };
 
+// The screen: a grid of cells, the cursor and the parser state. Every change
+// widens the dirty row range, which the window turns into a repaint.
 struct Terminal {
     Cell grid[kMaxRows][kMaxCols];
     std::uint32_t rows;
     std::uint32_t cols;
     std::uint32_t cursorRow;
     std::uint32_t cursorCol;
-    std::uint32_t curFg;
-    std::uint32_t curBg;
-    bool focused;
-    bool running;
-    bool cursorVisible;
-    std::uint64_t lastBlinkMs;
-
-    std::Handle masterFd;
-    std::uint64_t childPid;
-
+    ui::Color curFg;
+    ui::Color curBg;
     VTParser parser;
+    std::uint32_t dirtyTop;      // rows [dirtyTop, dirtyBottom) changed
+    std::uint32_t dirtyBottom;
 };
 
-static Terminal gTerminal = {};
+Terminal gTerminal = {};
+
+void touch_rows(Terminal* t, std::uint32_t top, std::uint32_t bottom) {
+    if (top >= bottom) {
+        return;
+    }
+    if (t->dirtyTop >= t->dirtyBottom) {
+        t->dirtyTop = top;
+        t->dirtyBottom = bottom;
+        return;
+    }
+    if (top < t->dirtyTop) t->dirtyTop = top;
+    if (bottom > t->dirtyBottom) t->dirtyBottom = bottom;
+}
+
+void touch_all(Terminal* t) {
+    touch_rows(t, 0, t->rows);
+}
 
 void clear_row(Terminal* t, std::uint32_t row, std::uint32_t fromCol) {
     for (std::uint32_t c = fromCol; c < t->cols; ++c) {
@@ -90,6 +101,7 @@ void clear_row(Terminal* t, std::uint32_t row, std::uint32_t fromCol) {
         t->grid[row][c].fg = t->curFg;
         t->grid[row][c].bg = t->curBg;
     }
+    touch_rows(t, row, row + 1);
 }
 
 void clear_all(Terminal* t) {
@@ -107,6 +119,7 @@ void scroll_up(Terminal* t) {
         }
     }
     clear_row(t, t->rows - 1, 0);
+    touch_all(t);
 }
 
 void newline(Terminal* t) {
@@ -126,6 +139,7 @@ void put_char(Terminal* t, char ch) {
     cell.ch = ch;
     cell.fg = t->curFg;
     cell.bg = t->curBg;
+    touch_rows(t, t->cursorRow, t->cursorRow + 1);
     t->cursorCol++;
 }
 
@@ -202,6 +216,7 @@ void handle_csi(Terminal* t, char final) {
                 for (std::uint32_t c = 0; c <= t->cursorCol && c < t->cols; ++c) {
                     t->grid[t->cursorRow][c].ch = ' ';
                 }
+                touch_rows(t, t->cursorRow, t->cursorRow + 1);
             } else if (a == 2) {
                 clear_row(t, t->cursorRow, 0);
             }
@@ -271,56 +286,30 @@ void feed_bytes(Terminal* t, const char* data, std::uint64_t len) {
     }
 }
 
-// ---- rendering ------------------------------------------------------------
-
-void fill_rect(std::uint32_t* px, std::uint32_t pitch, std::uint32_t W, std::uint32_t H,
-               int x, int y, int w, int h, std::uint32_t color) {
-    int x0 = x < 0 ? 0 : x;
-    int y0 = y < 0 ? 0 : y;
-    int x1 = x + w; if (x1 > (int)W) x1 = (int)W;
-    int y1 = y + h; if (y1 > (int)H) y1 = (int)H;
-    for (int row = y0; row < y1; ++row) {
-        for (int col = x0; col < x1; ++col) {
-            px[row * pitch + col] = color;
+// Rows and columns that fit `size`.
+void fit_grid(Terminal* t, ui::Size size, int cellW, int lineH) {
+    const int cols = (size.width - kPaddingX * 2) / cellW;
+    const int rows = (size.height - kPaddingY * 2) / lineH;
+    const std::uint32_t newCols = cols < 1 ? 1 : (cols > (int)kMaxCols ? kMaxCols : (std::uint32_t)cols);
+    const std::uint32_t newRows = rows < 1 ? 1 : (rows > (int)kMaxRows ? kMaxRows : (std::uint32_t)rows);
+    // Cells that come into view for the first time start blank.
+    for (std::uint32_t r = 0; r < newRows; ++r) {
+        for (std::uint32_t c = (r < t->rows ? t->cols : 0); c < newCols; ++c) {
+            t->grid[r][c] = { ' ', kColorDefaultFg, kColorBackground };
         }
     }
-}
-
-void draw_terminal(std::uint32_t* px, std::uint32_t pitch, std::uint32_t W, std::uint32_t H,
-                   instant::UIFont& font, Terminal* t) {
-    fill_rect(px, pitch, W, H, 0, 0, (int)W, (int)H, kColorBackground);
-
-    const int cellW = font.cellWidth;
-    const int lineH = font.lineHeight;
-    char glyph[2] = { 0, 0 };
-
-    for (std::uint32_t r = 0; r < t->rows; ++r) {
-        int baseY = kPaddingY + (int)r * lineH + font.baseline;
-        for (std::uint32_t c = 0; c < t->cols; ++c) {
-            const Cell& cell = t->grid[r][c];
-            int x = kPaddingX + (int)c * cellW;
-            if (cell.bg != kColorBackground) {
-                fill_rect(px, pitch, W, H, x, kPaddingY + (int)r * lineH, cellW, lineH, cell.bg);
-            }
-            if (cell.ch != ' ' && cell.ch != 0) {
-                glyph[0] = cell.ch;
-                instant::draw_text(px, W, H, font, x, baseY, glyph, cell.fg);
-            }
-        }
+    // Shrinking below the cursor scrolls the screen up so it stays in view.
+    t->cols = newCols;
+    while (t->cursorRow >= newRows) {
+        t->rows = t->cursorRow + 1;
+        scroll_up(t);
+        t->cursorRow--;
     }
-
-    if (t->cursorVisible && t->focused) {
-        int x = kPaddingX + (int)t->cursorCol * cellW;
-        int y = kPaddingY + (int)t->cursorRow * lineH;
-        fill_rect(px, pitch, W, H, x, y, cellW, lineH, kColorCursor);
-        if (t->cursorCol < t->cols) {
-            const Cell& cell = t->grid[t->cursorRow][t->cursorCol];
-            if (cell.ch != ' ' && cell.ch != 0) {
-                glyph[0] = cell.ch;
-                instant::draw_text(px, W, H, font, x, y + font.baseline, glyph, kColorBackground);
-            }
-        }
+    t->rows = newRows;
+    if (t->cursorCol > t->cols) {
+        t->cursorCol = t->cols;
     }
+    touch_all(t);
 }
 
 // ---- input ----------------------------------------------------------------
@@ -354,21 +343,12 @@ const char* key_sequence(std::uint16_t code) {
     }
 }
 
-// Translate a key event into bytes to write to the PTY master. Returns the
+// Translate a key press into bytes to write to the PTY master. Returns the
 // number of bytes written into out (up to 8), or 0 if the key is ignored.
-int translate_key(const std::Event& event, char* out) {
-    if (event.type != std::EventType::Key || event.key.action == std::KeyEventAction::Release) {
-        return 0;
-    }
-
-    // Super combinations are the desktop's shortcuts (Super+T, ...).
-    if ((event.key.modifiers & std::KeyModifierSuper) != 0) {
-        return 0;
-    }
-
-    const std::uint16_t code = event.key.keycode;
-    const bool ctrl = (event.key.modifiers & std::KeyModifierControl) != 0;
-    const bool alt = (event.key.modifiers & std::KeyModifierAlt) != 0;
+int translate_key(const ui::KeyEvent& key, char* out) {
+    const std::uint16_t code = key.key;
+    const bool ctrl = key.ctrl();
+    const bool alt = key.alt();
 
     if (const char* sequence = key_sequence(code)) {
         int n = 0;
@@ -376,8 +356,7 @@ int translate_key(const std::Event& event, char* out) {
         // Modifiers go in as xterm's parameter, 1 + Shift 1, Alt 2, Ctrl 4:
         // ESC [ A becomes ESC [ 1 ; 5 A, ESC O P ESC [ 1 ; 5 P, ESC [ 3 ~
         // ESC [ 3 ; 5 ~ (the kernel's console does the same).
-        const bool shift = (event.key.modifiers & std::KeyModifierShift) != 0;
-        const char param = (char)('1' + (shift ? 1 : 0) + (alt ? 2 : 0) + (ctrl ? 4 : 0));
+        const char param = (char)('1' + (key.shift() ? 1 : 0) + (alt ? 2 : 0) + (ctrl ? 4 : 0));
         if (param != '1') {
             const char final = out[n - 1];
             n = (final == '~') ? n - 1 : 2;
@@ -402,7 +381,7 @@ int translate_key(const std::Event& event, char* out) {
         default: break;
     }
 
-    const char ch = event.key.text[0];
+    const char ch = key.text[0];
     if (ctrl) {
         // Ctrl-A..Ctrl-Z -> 1..26, plus the other C0 controls on their keys.
         if (code >= std::KeyA && code <= std::KeyZ) { out[n++] = (char)(code - std::KeyA + 1); return n; }
@@ -449,49 +428,181 @@ std::uint64_t spawn_shell(std::Handle slaveFd) {
     return pid;
 }
 
-}  // namespace
+void build_pts_path(char* out, std::uint32_t n) {
+    const char* prefix = "/dev/pts/";
+    int i = 0;
+    while (prefix[i]) { out[i] = prefix[i]; i++; }
+    char digits[12];
+    int d = 0;
+    if (n == 0) { digits[d++] = '0'; }
+    while (n > 0) { digits[d++] = (char)('0' + (n % 10)); n /= 10; }
+    while (d > 0) { out[i++] = digits[--d]; }
+    out[i] = '\0';
+}
 
-class TerminalWindow : public instant::Window {
-private:
-    instant::WindowConfig configure() override {
-        instant::WindowConfig config = {};
-        config.width = static_cast<int>(kSurfaceWidth);
-        config.height = static_cast<int>(kSurfaceHeight);
-        config.title = "Terminal";
-        config.frameIntervalMs = kFrameIntervalMs;
-        config.autoCommit = false;
-        return config;
-    }
+class TerminalWindow : public ui::Window {
+    Terminal* t_ = &gTerminal;
+    ui::Font font_;
+    int cellW_ = 8;
+    int lineH_ = 16;
+    std::Handle master_ = fail;
+    bool cursorShown_ = true;
+    int blinkTimer_ = 0;
+    // Where the cursor was last painted, so moving it repaints the old row.
+    std::uint32_t paintedCursorRow_ = 0;
 
-    Result<bool, std::string> init() override {
-        if (!instant::initialize_ui_font(kFontPixelHeight)) {
-            return Result<bool, std::string>::error("font init failed");
+    void on_create() override {
+        if (font_.load(kFontPath, kFontPixelHeight)) {
+            cellW_ = font_.width("M");
+            lineH_ = font_.line_height();
         }
-
-        t_ = &gTerminal;
-        std::memset(t_, 0, sizeof(*t_));
-        t_->running = true;
-        t_->focused = true;
-        t_->cursorVisible = true;
         t_->curFg = kColorDefaultFg;
         t_->curBg = kColorBackground;
-        t_->masterFd = fail;
-        t_->childPid = fail;
-
-        const int cellW = instant::gUIFont.cellWidth > 0 ? instant::gUIFont.cellWidth : 8;
-        const int lineH = instant::gUIFont.lineHeight > 0 ? instant::gUIFont.lineHeight : 16;
-        t_->cols = (kSurfaceWidth - (kPaddingX * 2)) / (std::uint32_t)cellW;
-        t_->rows = (kSurfaceHeight - (kPaddingY * 2)) / (std::uint32_t)lineH;
-        if (t_->cols > kMaxCols) t_->cols = kMaxCols;
-        if (t_->rows > kMaxRows) t_->rows = kMaxRows;
-        clear_all(t_);
+        t_->rows = 0;
+        t_->cols = 0;
+        fit_grid(t_, client_size(), cellW_, lineH_);
 
         if (!open_pty()) {
-            return Result<bool, std::string>::error("pty open failed");
+            const char* message = "terminal: could not start a shell\r\n";
+            feed_bytes(t_, message, std::strlen(message));
+        }
+        blinkTimer_ = set_timer(kCursorBlinkMs);
+        flush();
+    }
+
+    void on_size(ui::Size size) override {
+        fit_grid(t_, size, cellW_, lineH_);
+        set_shell_size();
+    }
+
+    void on_destroy() override {
+        if (master_ != fail) {
+            std::close(master_);
+            master_ = fail;
+        }
+    }
+
+    void on_paint(ui::Canvas& canvas, const ui::Rect& dirty) override {
+        canvas.fill(dirty, kColorBackground);
+        const ui::Font& font = font_.valid() ? font_ : ui::Font::ui();
+        const int ascent = font.ascent();
+        int firstRow = (dirty.y - kPaddingY) / lineH_;
+        if (firstRow < 0) firstRow = 0;
+        const int lastRow = (dirty.bottom() - kPaddingY + lineH_ - 1) / lineH_;
+        char glyph[2] = { 0, 0 };
+
+        for (int r = firstRow; r < lastRow && r < (int)t_->rows; ++r) {
+            const int y = kPaddingY + r * lineH_;
+            for (std::uint32_t c = 0; c < t_->cols; ++c) {
+                const Cell& cell = t_->grid[r][c];
+                const int x = kPaddingX + (int)c * cellW_;
+                if (!(cell.bg == kColorBackground)) {
+                    canvas.fill({ x, y, cellW_, lineH_ }, cell.bg);
+                }
+                if (cell.ch != ' ' && cell.ch != 0) {
+                    glyph[0] = cell.ch;
+                    canvas.text(x, y + ascent, glyph, font, cell.fg);
+                }
+            }
         }
 
-        redraw_ = true;
+        // The cursor: a block while the window has the focus (blinking), an
+        // outline while it does not.
+        const int x = kPaddingX + (int)t_->cursorCol * cellW_;
+        const int y = kPaddingY + (int)t_->cursorRow * lineH_;
+        if (!focused()) {
+            canvas.frame({ x, y, cellW_, lineH_ }, kColorCursor);
+        } else if (cursorShown_) {
+            canvas.fill({ x, y, cellW_, lineH_ }, kColorCursor);
+            if (t_->cursorCol < t_->cols) {
+                const Cell& cell = t_->grid[t_->cursorRow][t_->cursorCol];
+                if (cell.ch != ' ' && cell.ch != 0) {
+                    glyph[0] = cell.ch;
+                    canvas.text(x, y + ascent, glyph, font, kColorBackground);
+                }
+            }
+        }
+        paintedCursorRow_ = t_->cursorRow;
+    }
+
+    bool on_key_down(const ui::KeyEvent& key) override {
+        char seq[8];
+        const int n = translate_key(key, seq);
+        if (n > 0 && master_ != fail) {
+            std::write(master_, seq, (std::uint64_t)n);
+            restart_blink();
+        }
+        // Every key belongs to the shell (Tab included).
         return true;
+    }
+
+    void on_readable(std::Handle handle) override {
+        char buf[512];
+        // A few reads at most, so a shell that prints without pause still
+        // lets the window repaint and take keys.
+        for (int i = 0; i < 32; ++i) {
+            std::PollFD pfd = { (std::int64_t)handle, 0x0001, 0 };
+            if (i > 0 && (std::poll(&pfd, 1, 0) == fail || (pfd.revents & 0x0001) == 0)) {
+                break;
+            }
+            const std::uint64_t n = std::read(handle, buf, sizeof(buf));
+            if (n == fail || n == 0) {
+                // The shell is gone: say so, and stop watching a master
+                // that will now always read as ready.
+                if (i == 0) {
+                    unwatch(handle);
+                    const char* message = "\r\n[shell exited]";
+                    feed_bytes(t_, message, std::strlen(message));
+                }
+                break;
+            }
+            feed_bytes(t_, buf, n);
+        }
+        restart_blink();
+        flush();
+    }
+
+    void on_timer(int id) override {
+        if (id == blinkTimer_) {
+            cursorShown_ = !cursorShown_;
+            touch_rows(t_, t_->cursorRow, t_->cursorRow + 1);
+            flush();
+        }
+    }
+
+    void on_focus(bool) override {
+        restart_blink();
+        flush();
+    }
+
+    void restart_blink() {
+        cursorShown_ = true;
+        touch_rows(t_, t_->cursorRow, t_->cursorRow + 1);
+        if (blinkTimer_ != 0) {
+            kill_timer(blinkTimer_);
+        }
+        blinkTimer_ = set_timer(kCursorBlinkMs);
+    }
+
+    // Repaints the rows the screen changed, and the cursor's old row.
+    void flush() {
+        touch_rows(t_, paintedCursorRow_, paintedCursorRow_ + 1);
+        if (t_->dirtyTop < t_->dirtyBottom) {
+            const int top = kPaddingY + (int)t_->dirtyTop * lineH_;
+            const int bottom = kPaddingY + (int)t_->dirtyBottom * lineH_;
+            invalidate({ 0, top, client_size().width, bottom - top });
+        }
+        t_->dirtyTop = t_->dirtyBottom = 0;
+    }
+
+    void set_shell_size() {
+        if (master_ == fail) {
+            return;
+        }
+        std::Winsize ws = {};
+        ws.ws_row = (std::uint16_t)t_->rows;
+        ws.ws_col = (std::uint16_t)t_->cols;
+        std::ioctl(master_, std::TIOCSWINSZ, reinterpret_cast<std::uint64_t>(&ws));
     }
 
     bool open_pty() {
@@ -499,13 +610,9 @@ private:
         if (master == fail) {
             return false;
         }
-        t_->masterFd = master;
-
+        master_ = master;
         // Set the window size so the shell knows the terminal geometry.
-        std::Winsize ws = {};
-        ws.ws_row = (std::uint16_t)t_->rows;
-        ws.ws_col = (std::uint16_t)t_->cols;
-        std::ioctl(master, std::TIOCSWINSZ, reinterpret_cast<std::uint64_t>(&ws));
+        set_shell_size();
 
         // Resolve the slave index and open /dev/pts/N.
         std::uint32_t ptn = 0;
@@ -519,120 +626,22 @@ private:
             return false;
         }
 
-        t_->childPid = spawn_shell(slave);
+        const std::uint64_t pid = spawn_shell(slave);
         std::close(slave);
+        if (pid == fail) {
+            return false;
+        }
         // The shell is the terminal's foreground job (each process is its own
         // group here): bash with job control waits until it is.
-        if (t_->childPid != fail) {
-            std::uint32_t pgrp = static_cast<std::uint32_t>(t_->childPid);
-            std::ioctl(master, std::TIOCSPGRP, reinterpret_cast<std::uint64_t>(&pgrp));
-        }
-        // Restore our own stdio slots to avoid keeping the slave bound here.
-        return t_->childPid != fail;
-    }
-
-    static void build_pts_path(char* out, std::uint32_t n) {
-        const char* prefix = "/dev/pts/";
-        int i = 0;
-        while (prefix[i]) { out[i] = prefix[i]; i++; }
-        char digits[12];
-        int d = 0;
-        if (n == 0) { digits[d++] = '0'; }
-        while (n > 0) { digits[d++] = (char)('0' + (n % 10)); n /= 10; }
-        while (d > 0) { out[i++] = digits[--d]; }
-        out[i] = '\0';
-    }
-
-    Result<bool, std::string> update() override {
-        if (!t_) {
-            return true;
-        }
-
-        // Drain available output from the master without blocking forever.
-        if (t_->masterFd != fail) {
-            std::PollFD pfd = {};
-            pfd.fd = (std::int64_t)t_->masterFd;
-            pfd.events = 0x0001;  // POLLIN
-            char buf[512];
-            for (int iter = 0; iter < 32; ++iter) {
-                pfd.revents = 0;
-                std::poll(&pfd, 1);
-                if ((pfd.revents & 0x0001) == 0) {
-                    break;
-                }
-                std::uint64_t n = std::read(t_->masterFd, buf, sizeof(buf));
-                if (n == fail || n == 0) {
-                    break;
-                }
-                feed_bytes(t_, buf, n);
-                redraw_ = true;
-            }
-        }
-
-        const std::uint64_t now = std::gettime();
-        if (now - t_->lastBlinkMs >= kCursorBlinkMs) {
-            t_->cursorVisible = !t_->cursorVisible;
-            t_->lastBlinkMs = now;
-            redraw_ = true;
-        }
-
-        if (redraw_) {
-            draw_terminal(pixels(), (std::uint32_t)pitch(), (std::uint32_t)width(),
-                          (std::uint32_t)height(), instant::gUIFont, t_);
-            if (!commit()) {
-                return Result<bool, std::string>::error("surface_commit failed");
-            }
-            redraw_ = false;
-        }
-
-        return t_->running;
-    }
-
-    Result<bool, std::string> event(const std::Event& event) override {
-        if (!t_) {
-            return true;
-        }
-
-        if (event.type == std::EventType::Window) {
-            if (event.window.action == std::WindowEventAction::FocusGained) {
-                t_->focused = true;
-                redraw_ = true;
-            } else if (event.window.action == std::WindowEventAction::FocusLost) {
-                t_->focused = false;
-                redraw_ = true;
-            } else if (event.window.action == std::WindowEventAction::CloseRequested) {
-                t_->running = false;
-                return false;
-            }
-            return t_->running;
-        }
-
-        char seq[8];
-        int n = translate_key(event, seq);
-        if (n > 0 && t_->masterFd != fail) {
-            std::write(t_->masterFd, seq, (std::uint64_t)n);
-            t_->cursorVisible = true;
-            t_->lastBlinkMs = std::gettime();
-            redraw_ = true;
-        }
-
-        return t_->running;
-    }
-
-    Result<bool, std::string> event() override {
+        std::uint32_t pgrp = static_cast<std::uint32_t>(pid);
+        std::ioctl(master, std::TIOCSPGRP, reinterpret_cast<std::uint64_t>(&pgrp));
+        watch(master);
         return true;
     }
-
-    void cleanup() override {
-        instant::destroy_ui_font();
-        if (t_ && t_->masterFd != fail) {
-            std::close(t_->masterFd);
-            t_->masterFd = fail;
-        }
-    }
-
-    Terminal* t_ = nullptr;
-    bool redraw_ = false;
 };
 
-INSTANT_WINDOW_APP(TerminalWindow)
+}  // namespace
+
+int main(int, char**) {
+    return ui::run<TerminalWindow>({ .width = 920, .height = 560, .title = "Terminal" });
+}

@@ -65,9 +65,14 @@ void remember_surface(SurfaceCacheEntry* cache, const std::SurfaceInfo& info) {
         entry = &cache[0];
     }
 
+    if (!entry->valid || entry->id != info.id) {
+        entry->generation = 0;
+    }
     entry->valid = true;
     entry->id = info.id;
     entry->info = info;
+    entry->unshownLists = 0;   // just committed: about to be shown
+    ++entry->generation;   // the GL renderer uploads a shared-memory surface again
     const Rect oldDirty = entry->dirty
         ? Rect { static_cast<int>(entry->dirtyX), static_cast<int>(entry->dirtyY),
                  static_cast<int>(entry->dirtyWidth), static_cast<int>(entry->dirtyHeight) }
@@ -89,7 +94,7 @@ void remember_surface(SurfaceCacheEntry* cache, const std::SurfaceInfo& info) {
 // Drops the surfaces no window shows any more (a window that was resized got
 // a new one, or closed). The kernel unmaps a dead surface from us when we
 // list the windows, so this runs on each new list and nothing below may
-// still use their addresses.
+// still use their addresses (only a shown surface's entry is ever read).
 void forget_unshown_surfaces(SurfaceCacheEntry* cache, const std::WindowInfo* windows, std::uint64_t windowCount) {
     for (std::uint64_t i = 0; i < kMaxSurfaceCache; ++i) {
         if (!cache[i].valid) {
@@ -99,7 +104,14 @@ void forget_unshown_surfaces(SurfaceCacheEntry* cache, const std::WindowInfo* wi
         for (std::uint64_t w = 0; w < windowCount && !shown; ++w) {
             shown = windows[w].surfaceID == cache[i].id;
         }
-        if (!shown) {
+        // A surface committed but not attached yet (a program commits, then
+        // attaches) must survive the list in between, or the window shows no
+        // pixels until that surface is committed again: a GPU program's
+        // window blinked. Only surfaces a window shows are ever read, and
+        // those are alive, so a dead one's entry may stay a few lists.
+        if (shown) {
+            cache[i].unshownLists = 0;
+        } else if (++cache[i].unshownLists > kSurfaceForgetLists) {
             cache[i] = {};
         }
     }
@@ -119,106 +131,198 @@ bool pump_surface_updates(SurfaceCacheEntry* cache) {
     return changed;
 }
 
-int window_control_slot_from_left(int control) {
-    if (control == 0) {
-        return 0;
-    }
-    if (control == 2) {
-        return 1;
-    }
-    return 2;
-}
+WindowHover gWindowHover = {};
 
+// Close at the right edge, then maximize, then minimize.
 Rect window_control_rect(const std::WindowInfo& window, int control) {
-    const int size = kButtonSize;
-    const int x = window.x + kButtonMarginLeft + (window_control_slot_from_left(control) * (size + kButtonGap));
-    const int y = window.y + ((kTitleBarHeight - size) / 2);
-    return { x, y, size, size };
+    const int slotFromRight = control == kControlClose ? 0 : control == kControlMinimize ? 2 : 1;
+    const int x = window.x + frame_width(window) - kBorder - (slotFromRight + 1) * kControlWidth;
+    return { x, window.y + kBorder, kControlWidth, kTitleBarHeight - kBorder };
 }
 
-void draw_window_control_icon_fallback(ui::Canvas& canvas, const Rect& rect, int control, bool maximized) {
-    const ui::Color iconColor = ui::rgb(kTitleText);
-    const int centerX = rect.x + (rect.width / 2);
-    const int centerY = rect.y + (rect.height / 2);
-    const int half = kControlIconSize / 2;
-    const int thickness = 2;
-
-    if (control == 0) {
-        canvas.line({ centerX - half, centerY - half }, { centerX + half, centerY + half }, iconColor, thickness);
-        canvas.line({ centerX + half, centerY - half }, { centerX - half, centerY + half }, iconColor, thickness);
-        return;
-    }
-
-    if (control == 1) {
-        const int left = centerX - half;
-        const int top = centerY - half;
-        if (maximized) {
-            canvas.fill({ left + 3, top, kControlIconSize - 1, thickness }, iconColor);
-            canvas.fill({ left + kControlIconSize, top, thickness, kControlIconSize - 1 }, iconColor);
-            canvas.fill({ left + 3, top + kControlIconSize - 1, kControlIconSize - 1, thickness }, iconColor);
-            canvas.fill({ left + 2, top + 3, thickness, kControlIconSize - 1 }, iconColor);
-        } else {
-            canvas.fill({ left, top, kControlIconSize + 1, thickness }, iconColor);
-            canvas.fill({ left, top, thickness, kControlIconSize + 1 }, iconColor);
-            canvas.fill({ left, top + kControlIconSize, kControlIconSize + 1, thickness }, iconColor);
-            canvas.fill({ left + kControlIconSize, top, thickness, kControlIconSize + 1 }, iconColor);
-        }
-        return;
-    }
-
-    canvas.fill({ centerX - half, centerY, kControlIconSize + 1, thickness }, iconColor);
-}
-
-void draw_window_control_icon(ui::Canvas& canvas, const Rect& rect, int control,
-                              bool maximized, const WindowControlAssets* controls) {
-    const ui::Image* icon = nullptr;
-    if (controls) {
-        if (control == 0) {
-            icon = &controls->close;
-        } else if (control == 1) {
-            icon = &controls->resize;
-        } else {
-            icon = &controls->minimize;
+int title_icon_index(const char* title) {
+    static const char* const kTitles[kTitleIconCount - 1] = { "Terminal", "File Browser", "Background Switcher",
+                                                               "Cube", "NetSurf" };
+    for (int i = 0; i < kTitleIconCount - 1; ++i) {
+        if (std::strcmp(title, kTitles[i]) == 0) {
+            return i;
         }
     }
+    return kTitleIconCount - 1;
+}
 
-    if (icon && icon->valid()) {
-        const int iconSize = kControlIconSize + 6;
-        canvas.image(*icon, Rect { rect.x + ((rect.width - iconSize) / 2), rect.y + ((rect.height - iconSize) / 2),
-                                   iconSize, iconSize });
+namespace {
+
+// A soft shadow under the frame: black fading with the distance from the
+// frame's rounded shape moved down by kShadowOffsetY. The alpha depends only
+// on how far a pixel is past the corner circle's centre in x and in y, so it
+// comes from a table made once per focus state. Only the ring outside the
+// frame is drawn; the frame covers the rest.
+constexpr int kShadowReach = kShadowBlur + kWindowCornerRadius + 1;
+
+struct ShadowTable {
+    bool ready;
+    std::uint8_t alpha[kShadowReach][kShadowReach];
+};
+
+const ShadowTable& shadow_table(bool focused) {
+    static ShadowTable tables[2] = {};
+    ShadowTable& table = tables[focused ? 1 : 0];
+    if (!table.ready) {
+        const float maxAlpha = focused ? 120.0f : 70.0f;
+        for (int a = 0; a < kShadowReach; ++a) {
+            for (int b = 0; b < kShadowReach; ++b) {
+                const float distance = sqrtf(static_cast<float>(a * a + b * b)) - kWindowCornerRadius;
+                const float t = distance <= 0.0f ? 1.0f : distance >= kShadowBlur ? 0.0f : 1.0f - distance / kShadowBlur;
+                table.alpha[a][b] = static_cast<std::uint8_t>(maxAlpha * t * t);
+            }
+        }
+        table.ready = true;
+    }
+    return table;
+}
+
+void draw_window_shadow(ui::Canvas& canvas, const Rect& frame, bool focused) {
+    const Rect shape = frame.offset(0, kShadowOffsetY);
+    const Rect clip = canvas.clip();
+    if (Rect { shape.x - kShadowBlur, shape.y - kShadowBlur, shape.width + 2 * kShadowBlur,
+               shape.height + 2 * kShadowBlur }.intersect(clip).empty()) {
         return;
     }
+    const ShadowTable& table = shadow_table(focused);
+    // The corner circles' centres.
+    const int left = shape.x + kWindowCornerRadius;
+    const int right = shape.right() - 1 - kWindowCornerRadius;
+    const int top = shape.y + kWindowCornerRadius;
+    const int bottom = shape.bottom() - 1 - kWindowCornerRadius;
+    auto shade = [](std::uint8_t alpha) { return ui::rgba(0x000000, alpha); };
 
-    draw_window_control_icon_fallback(canvas, rect, control, maximized);
+    // Along the straight edges the alpha is the same down a column (sides)
+    // or along a row (top, bottom), so those are 1 px spans; the parts the
+    // frame covers are left out.
+    for (int d = 1; d < kShadowReach; ++d) {
+        const std::uint8_t alpha = table.alpha[d][0];
+        if (alpha == 0) {
+            break;
+        }
+        // Left and right columns, between the corner rows, outside the frame.
+        canvas.fill({ left - d, top, 1, bottom - top + 1 }, shade(left - d < frame.x ? alpha : 0));
+        canvas.fill({ right + d, top, 1, bottom - top + 1 }, shade(right + d >= frame.right() ? alpha : 0));
+        // Top and bottom rows, between the corner columns.
+        if (top - d < frame.y) {
+            canvas.fill({ left, top - d, right - left + 1, 1 }, shade(alpha));
+        }
+        if (bottom + d >= frame.bottom()) {
+            canvas.fill({ left, bottom + d, right - left + 1, 1 }, shade(alpha));
+        }
+    }
+    // The four corners, pixel by pixel.
+    const ui::Color black = ui::rgb(0x000000);
+    const int cornerX[2] = { left, right };
+    const int cornerY[2] = { top, bottom };
+    for (int cy = 0; cy < 2; ++cy) {
+        for (int cx = 0; cx < 2; ++cx) {
+            const int stepX = cx == 0 ? -1 : 1;
+            const int stepY = cy == 0 ? -1 : 1;
+            for (int dy = 1; dy < kShadowReach; ++dy) {
+                const int y = cornerY[cy] + stepY * dy;
+                if (y < clip.y || y >= clip.bottom()) {
+                    continue;
+                }
+                for (int dx = 1; dx < kShadowReach; ++dx) {
+                    const int x = cornerX[cx] + stepX * dx;
+                    if (x < clip.x || x >= clip.right()) {
+                        continue;
+                    }
+                    if (x >= frame.x && x < frame.right() && y >= frame.y && y < frame.bottom() &&
+                        ui::in_rounded_rect(frame, kWindowCornerRadius, x, y)) {
+                        continue;
+                    }
+                    const std::uint8_t alpha = table.alpha[dx][dy];
+                    if (alpha != 0) {
+                        canvas.blend_pixel(x, y, black, alpha);
+                    }
+                }
+            }
+        }
+    }
 }
+
+// The close button's red, cut to the frame's rounded top right corner.
+void fill_close_hover(ui::Canvas& canvas, const Rect& button, const Rect& inner, int radius, ui::Color color) {
+    const Rect area = button.intersect(canvas.clip());
+    for (int y = area.y; y < area.bottom(); ++y) {
+        int right = area.right();
+        while (right > area.x && !ui::in_rounded_rect(inner, radius, right - 1, y)) {
+            --right;
+        }
+        if (right > area.x) {
+            canvas.fill({ area.x, y, right - area.x, 1 }, color);
+        }
+    }
+}
+
+}  // namespace
 
 void draw_window_frame(ui::Canvas& canvas, const std::WindowInfo& window, const WindowControlAssets* controls) {
+    const ui::Theme& t = ui::theme();
     const bool focused = (window.state & std::WindowStateFocused) != 0;
     const bool maximized = (window.state & std::WindowStateMaximized) != 0;
-    const int frameX = window.x;
-    const int frameY = window.y;
-    const int totalWidth = frame_width(window);
-    const int totalHeight = frame_height(window);
-    const int innerX = frameX + kBorder;
-    const int innerY = frameY + kBorder;
-    const int innerWidth = window.width;
-    const int innerHeight = totalHeight - (kBorder * 2);
-    const int innerRadius = kWindowCornerRadius > kBorder ? (kWindowCornerRadius - kBorder) : 0;
+    const Rect frame = { window.x, window.y, frame_width(window), frame_height(window) };
+    const Rect inner = frame.inset(kBorder);
+    const int innerRadius = kWindowCornerRadius - kBorder;
 
-    canvas.fill_rounded({ frameX, frameY, totalWidth, totalHeight }, kWindowCornerRadius,
-                        ui::rgb(focused ? kWindowBorderFocused : kWindowBorder));
-    canvas.fill_rounded({ innerX, innerY, innerWidth, innerHeight }, innerRadius, ui::rgb(kWindowBackground));
-    canvas.fill_top_rounded({ innerX, innerY, innerWidth, kTitleBarHeight - kBorder }, innerRadius,
-                            ui::rgb(focused ? kTitleBarFocused : kTitleBar));
-    canvas.fill_top_rounded({ innerX, innerY, innerWidth, 1 }, innerRadius, ui::rgb(kTitleBarHighlight));
+    draw_window_shadow(canvas, frame, focused);
+    canvas.fill_rounded(frame, kWindowCornerRadius, t.window);
+    canvas.frame(frame, ui::rgba(0xffffff, focused ? 26 : 15), 1, kWindowCornerRadius);
+    (void)maximized;
+    (void)inner;
+    (void)innerRadius;
+    draw_window_title(canvas, window, controls);
+}
 
-    draw_window_control_icon(canvas, window_control_rect(window, 2), 2, maximized, controls);
-    draw_window_control_icon(canvas, window_control_rect(window, 1), 1, maximized, controls);
-    draw_window_control_icon(canvas, window_control_rect(window, 0), 0, maximized, controls);
+// What the title bar shows over the window colour: the app's icon and name,
+// the controls (with the hovered one's highlight). The GL renderer draws the
+// rest of the frame itself and this into a texture.
+void draw_window_title(ui::Canvas& canvas, const std::WindowInfo& window, const WindowControlAssets* controls) {
+    const ui::Theme& t = ui::theme();
+    const bool focused = (window.state & std::WindowStateFocused) != 0;
+    const bool maximized = (window.state & std::WindowStateMaximized) != 0;
+    const Rect frame = { window.x, window.y, frame_width(window), frame_height(window) };
+    const Rect inner = frame.inset(kBorder);
+    const int innerRadius = kWindowCornerRadius - kBorder;
 
-    const ui::Font& font = ui::Font::ui();
+    // The app's icon and name.
+    const int tint = focused ? 0 : 1;
+    const int icon = title_icon_index(window.title);
+    if (controls && controls->apps[icon][tint].valid()) {
+        canvas.image(controls->apps[icon][tint],
+                     ui::Point { frame.x + kTitleIconX, frame.y + (kTitleBarHeight - kTitleIconSize) / 2 });
+    }
     const char* title = window.title[0] ? window.title : "Window";
-    canvas.text(frameX + ((totalWidth - font.width(title)) / 2), frameY + 22, title, font, ui::rgb(kTitleText));
+    const int controlsLeft = window_control_rect(window, kControlMinimize).x;
+    canvas.text({ frame.x + kTitleTextX, frame.y, controlsLeft - frame.x - kTitleTextX - 8, kTitleBarHeight }, title,
+                t.fontMedium(), focused ? t.text : t.textUnfocused, ui::AlignLeft | ui::AlignMiddle);
+
+    // Minimize, maximize (restore when maximized), close.
+    for (int control = kControlClose; control <= kControlMinimize; ++control) {
+        const Rect button = window_control_rect(window, control);
+        const bool hovered = gWindowHover.windowId == window.id && gWindowHover.control == control;
+        int glyphTint = tint;
+        if (hovered && control == kControlClose) {
+            fill_close_hover(canvas, button, inner, innerRadius, t.danger);
+            glyphTint = 2;
+        } else if (hovered) {
+            canvas.fill(button, t.faceHover);
+            glyphTint = 0;
+        }
+        const int glyph = control == kControlMaximize && maximized ? kControlRestore : control;
+        if (controls && controls->glyphs[glyph][glyphTint].valid()) {
+            canvas.image(controls->glyphs[glyph][glyphTint],
+                         ui::Point { button.x + (button.width - kControlGlyphSize) / 2,
+                                     button.y + (button.height - kControlGlyphSize) / 2 });
+        }
+    }
 }
 
 // The window's surface into its content area, opaque. The rows level with

@@ -1,4 +1,7 @@
 #include "common.hpp"
+#ifdef INSTANTOS_MLIBC
+#include <pthread.h>
+#endif
 
 void write_str(const char* s) {
     std::serial_write(s, std::strlen(s));
@@ -48,6 +51,12 @@ void report_timing_if_needed() {
     write_u64(gTiming.sceneRedrawMs);
     write_str("ms present=");
     write_u64(gTiming.presentMs);
+    if (gTiming.flips != 0) {
+        write_str("ms flips=");
+        write_u64(gTiming.flips);
+        write_str(" flipwait=");
+        write_u64(gTiming.flipWaitMs);
+    }
     write_str("ms\n");
 }
 
@@ -89,14 +98,14 @@ bool launch_taskbar_slot(int slot) {
 }
 
 const char* taskbar_slot_label(int slot) {
-    static const char* const labels[kTaskbarCenterSlotCount] = { "Terminal", "Files", "Walls", "Cube", "Web" };
-    return slot >= 0 && slot < kTaskbarCenterSlotCount ? labels[slot] : "";
+    static const char* const labels[kPinnedCount] = { "Terminal", "Files", "Wallpapers", "Cube", "Web" };
+    return slot >= 0 && slot < kPinnedCount ? labels[slot] : "";
 }
 
 const char* taskbar_slot_window_title(int slot) {
-    static const char* const titles[kTaskbarCenterSlotCount] = {
+    static const char* const titles[kPinnedCount] = {
         "Terminal", "File Browser", "Background Switcher", "Cube", "NetSurf" };
-    return slot >= 0 && slot < kTaskbarCenterSlotCount ? titles[slot] : "";
+    return slot >= 0 && slot < kPinnedCount ? titles[slot] : "";
 }
 
 volatile bool gNetworkOnline = false;
@@ -132,9 +141,18 @@ void watch_network(void*) {
 
 void start_network_watch(std::Handle wakeQueue) {
     gNetworkWakeQueue = wakeQueue;
+#ifdef INSTANTOS_MLIBC
+    // On mlibc a thread must be mlibc's (its TLS and errno): a raw kernel
+    // thread would fault in the first libc call it makes.
+    pthread_t thread;
+    if (pthread_create(&thread, nullptr, [](void*) -> void* { watch_network(nullptr); return nullptr; }, nullptr) != 0) {
+        write_str("[graphics.compositor] network watch thread failed\n");
+    }
+#else
     if (std::thread_create(watch_network) == fail) {
         write_str("[graphics.compositor] network watch thread failed\n");
     }
+#endif
 }
 
 bool decode_event_message(const std::IPCMessage& message, std::Event* event) {

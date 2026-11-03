@@ -44,8 +44,7 @@ private:
     std::uint16_t pointerButtons = 0;
     DesktopBackground background = {};
     CursorImage cursorImage = {};
-    ui::Image taskbarBrand;
-    TaskbarStatusAssets taskbarStatus = {};
+    TaskbarAssets taskbar = {};
     WindowControlAssets windowControls = {};
     std::WindowInfo windowSnapshot[kMaxWindows] = {};
     std::uint64_t windowSnapshotCount = 0;
@@ -93,18 +92,18 @@ private:
 
     bool initializeBackend(int argc, char** argv) {
         backend = compositor_backend_select(framebuffer, argc, argv);
+#ifdef INSTANTOS_COMPOSITOR_GL
+        if (backend && backend->kind() == CompositorBackendKind::Gl) {
+            gl_backend_set_scene(windowSnapshot, &windowSnapshotCount, gSurfaceCache, &background, &taskbar,
+                                 &windowControls);
+        }
+#endif
         return backend != nullptr;
     }
 
     bool initializeFonts() {
         if (!ui::Font::ui().valid()) {
             write_str("[graphics.compositor] ui font load failed, continuing without text\n");
-        }
-        if (!gClockTimeFont.load(kClockTimeFontPath, kClockTimeFontPixelHeight)) {
-            write_str("[graphics.compositor] clock time font load failed, using ui font\n");
-        }
-        if (!gClockDateFont.load(kClockDateFontPath, kClockDateFontPixelHeight)) {
-            write_str("[graphics.compositor] clock date font load failed, using ui font\n");
         }
         return true;
     }
@@ -128,62 +127,74 @@ private:
         if (!cursorImage.loadFromFile(kDefaultCursorPath)) {
             write_str("[graphics.compositor] cursor load failed\n");
         }
-        if (!taskbarBrand.load(kTaskbarBrandPath)) {
-            write_str("[graphics.compositor] taskbar brand load failed\n");
-        } else if (!taskbarBrand.resize(kTaskbarBrandWidth, kTaskbarBrandHeight)) {
-            write_str("[graphics.compositor] taskbar brand resize failed\n");
-        }
-        taskbarStatus.load();
+        taskbar.load();
         windowControls.load();
     }
 
     void renderInitialScene() {
         sceneBuffer = &buffers.acquire();
         updateWindowSnapshot();
-        redraw_scene(*sceneBuffer, windowSnapshot, windowSnapshotCount, gSurfaceCache, &background, &taskbarBrand, &taskbarStatus, &windowControls);
+        if (!backend->drawsScene()) {
+            redraw_scene(*sceneBuffer, windowSnapshot, windowSnapshotCount, gSurfaceCache, &background, &taskbar, &windowControls);
+        }
         backend->presentFull(*sceneBuffer, cursor, cursorImage);
+        backend->commit();
         ++gTiming.frames;
     }
 
     void eventLoop() {
         for (;;) {
-            bool fullSceneDirty = false;
-            bool surfaceDirty = pumpSurfaceUpdatesOnce();
-            Rect windowDirty = { 0, 0, 0, 0 };
+            runOnce();
+            backend->commit();
+        }
+    }
 
-            if (!surfaceDirty) {
-                std::IPCMessage message = {};
-                if (std::queue_receive(queue, &message, true) != fail) {
-                    handleMessage(message, &fullSceneDirty, &windowDirty);
-                }
-            }
+    // One pass: wait for something to happen, take everything that is
+    // queued, redraw what changed (the backend shows it at commit()).
+    void runOnce() {
+        bool fullSceneDirty = false;
+        bool surfaceDirty = pumpSurfaceUpdatesOnce();
+        Rect windowDirty = { 0, 0, 0, 0 };
 
-            drainMessages(&fullSceneDirty, &windowDirty);
-            if (gNetworkOnline != shownNetworkOnline) {
-                shownNetworkOnline = gNetworkOnline;
-                fullSceneDirty = true;
+        if (!surfaceDirty) {
+            std::IPCMessage message = {};
+            if (std::queue_receive(queue, &message, true) != fail) {
+                handleMessage(message, &fullSceneDirty, &windowDirty);
             }
+        }
 
-            if (pumpSurfaceUpdatesOnce()) {
-                surfaceDirty = true;
-            }
-            if (updateWindowSnapshot()) {
-                fullSceneDirty = true;
-            }
+        drainMessages(&fullSceneDirty, &windowDirty);
+        if (gNetworkOnline != shownNetworkOnline) {
+            shownNetworkOnline = gNetworkOnline;
+            fullSceneDirty = true;
+        }
 
-            if (fullSceneDirty) {
-                redrawFullScene();
-                continue;
-            }
+        if (pumpSurfaceUpdatesOnce()) {
+            surfaceDirty = true;
+        }
+        if (updateWindowSnapshot()) {
+            fullSceneDirty = true;
+        }
+        // A program commits a surface before it attaches it: one the list
+        // names that was committed after the poll above is in the queue now.
+        // Without this the window was drawn empty for a pass (a GPU program
+        // swapping buffers blinked).
+        if (pumpSurfaceUpdatesOnce()) {
+            surfaceDirty = true;
+        }
 
-            if (surfaceDirty) {
-                const Rect dirty = consume_surface_dirty_rect(windowSnapshot, windowSnapshotCount, gSurfaceCache, fbInfo.width, fbInfo.height);
-                windowDirty = windowDirty.unite(dirty);
-            }
+        if (fullSceneDirty) {
+            redrawFullScene();
+            return;
+        }
 
-            if (!windowDirty.empty()) {
-                redrawDirtyRect(windowDirty);
-            }
+        if (surfaceDirty) {
+            const Rect dirty = consume_surface_dirty_rect(windowSnapshot, windowSnapshotCount, gSurfaceCache, fbInfo.width, fbInfo.height);
+            windowDirty = windowDirty.unite(dirty);
+        }
+
+        if (!windowDirty.empty()) {
+            redrawDirtyRect(windowDirty);
         }
     }
 
@@ -228,9 +239,30 @@ private:
         return changed;
     }
 
+    // A new window whose frame would reach under the taskbar moves up, and
+    // shrinks if it is taller than the work area.
+    void keepAboveTaskbar(std::WindowInfo* window) {
+        const int bottom = work_area_bottom(fbInfo.height);
+        if (window->y + frame_height(*window) <= bottom) {
+            return;
+        }
+        int y = bottom - frame_height(*window);
+        if (y < 8) {
+            y = 8;
+        }
+        if (y != window->y && std::compositor_move_window(window->id, window->x, y) != fail) {
+            window->y = y;
+        }
+        const int room = bottom - window->y - kTitleBarHeight - kBorder;
+        if (window->height > room && room > 48 &&
+            std::compositor_resize_window(window->id, window->width, room) != fail) {
+            window->height = room;
+        }
+    }
+
     // One serial line per window that was not there before: where it opened
     // (the content area starts kBorder right of x and kTitleBarHeight below y).
-    void logNewWindows(const std::WindowInfo* current, std::uint64_t count) {
+    void logNewWindows(std::WindowInfo* current, std::uint64_t count) {
         for (std::uint64_t i = 0; i < count && i < kMaxWindows; ++i) {
             bool known = false;
             for (std::uint64_t j = 0; j < windowSnapshotCount && !known; ++j) {
@@ -239,6 +271,7 @@ private:
             if (known || current[i].x < 0 || current[i].y < 0) {
                 continue;
             }
+            keepAboveTaskbar(&current[i]);
             char title[sizeof(current[i].title) + 1] = {};
             std::memcpy(title, current[i].title, sizeof(current[i].title));
             write_str("[graphics.compositor] window id=");
@@ -305,8 +338,10 @@ private:
         move_cursor(framebuffer, &cursor, event.pointer.x, event.pointer.y);
         if (handle_pointer_event(event, windowSnapshot, windowSnapshotCount, fbInfo.width, fbInfo.height, &drag, &pointerButtons, windowDirty)) {
             *fullSceneDirty = true;
-        } else if (!*fullSceneDirty && (!windowDirty || windowDirty->empty()) &&
-                   (previousCursor.x != cursor.x || previousCursor.y != cursor.y)) {
+        } else if (!*fullSceneDirty && (previousCursor.x != cursor.x || previousCursor.y != cursor.y)) {
+            // Also when part of the scene is about to be repainted (a hovered
+            // button): that repaint draws the pointer at its new place but
+            // would not clear it from the old one.
             backend->presentCursorMove(*sceneBuffer, previousCursor, cursor, cursorImage);
         }
     }
@@ -382,7 +417,9 @@ private:
     void redrawFullScene() {
         sceneBuffer = &buffers.acquire();
         updateWindowSnapshot();
-        redraw_scene(*sceneBuffer, windowSnapshot, windowSnapshotCount, gSurfaceCache, &background, &taskbarBrand, &taskbarStatus, &windowControls);
+        if (!backend->drawsScene()) {
+            redraw_scene(*sceneBuffer, windowSnapshot, windowSnapshotCount, gSurfaceCache, &background, &taskbar, &windowControls);
+        }
         clear_surface_dirty_flags(gSurfaceCache);
         backend->presentFull(*sceneBuffer, cursor, cursorImage);
         ++gTiming.frames;
@@ -395,7 +432,9 @@ private:
             return;
         }
 
-        redraw_scene_rect(*sceneBuffer, windowSnapshot, windowSnapshotCount, gSurfaceCache, &background, windowDirty, &taskbarBrand, &taskbarStatus, &windowControls);
+        if (!backend->drawsScene()) {
+            redraw_scene_rect(*sceneBuffer, windowSnapshot, windowSnapshotCount, gSurfaceCache, &background, windowDirty, &taskbar, &windowControls);
+        }
         backend->presentRect(*sceneBuffer, windowDirty, cursor, cursorImage);
         ++gTiming.frames;
         report_timing_if_needed();

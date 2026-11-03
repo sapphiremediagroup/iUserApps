@@ -97,34 +97,20 @@ function(add_user_app_sources target_name)
     set_target_properties(${target_name} PROPERTIES SUFFIX "")
 endfunction()
 
-function(add_instant_window_app target_name)
-    file(GLOB app_sources CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp")
-    add_executable(${target_name} ${app_sources} $<TARGET_OBJECTS:instant_window_crt0>)
-    target_compile_options(${target_name} PRIVATE ${USER_CXX_FLAGS} ${SIZE_CXX_FLAGS})
-    target_link_libraries(${target_name} PRIVATE ilibcxx::ilibcxx)
-    target_link_options(${target_name} PRIVATE
-        ${USER_LINK_OPTIONS}
-        -pie
-        -e _start
-        --dynamic-linker
-        /lib/ld-instantos.so
-        "SHELL:-z now"
-    )
-    set_target_properties(${target_name} PROPERTIES SUFFIX "")
-endfunction()
-
 add_subdirectory(outside/ilibcxx)
 add_subdirectory(ld-instantos)
 
 add_subdirectory(input-manager)
 add_subdirectory(graphics-compositor)
 add_subdirectory(storage-manager)
+add_subdirectory(log-saver)
+add_subdirectory(gpu-test)
+add_subdirectory(reboot)
 add_subdirectory(process-manager)
 add_subdirectory(network-manager)
 add_subdirectory(font-manager)
 add_subdirectory(session-manager)
 add_subdirectory(login)
-add_subdirectory(desktop-shell)
 add_subdirectory(background-switcher)
 add_subdirectory(file-browser)
 add_subdirectory(terminal)

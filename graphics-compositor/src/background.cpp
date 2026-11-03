@@ -62,6 +62,76 @@ void scale_background_image(DesktopBackground* background, const ui::Image& imag
     }
 }
 
+// Three box blurs (close to a Gaussian) of the wallpaper under the taskbar,
+// kept so the bar can show it without blurring on every redraw.
+void blur_bar_backdrop(DesktopBackground* background) {
+    const Rect bar = taskbar_bar_rect(background->width, background->height);
+    const int reach = 3 * kBarBlurRadius;
+    const Rect source = Rect { bar.x - reach, bar.y - reach, bar.width + 2 * reach, bar.height + 2 * reach }
+        .intersect({ 0, 0, static_cast<int>(background->width), static_cast<int>(background->height) });
+    delete[] background->barBlur;
+    background->barBlur = nullptr;
+    if (source.empty() || bar.empty()) {
+        return;
+    }
+    const int w = source.width;
+    const int h = source.height;
+    std::uint32_t* work = new (std::nothrow) std::uint32_t[static_cast<std::size_t>(w) * h];
+    std::uint32_t* temp = new (std::nothrow) std::uint32_t[static_cast<std::size_t>(w) * h];
+    std::uint32_t* out = new (std::nothrow) std::uint32_t[static_cast<std::size_t>(bar.width) * bar.height];
+    if (!work || !temp || !out) {
+        delete[] work;
+        delete[] temp;
+        delete[] out;
+        return;
+    }
+    for (int y = 0; y < h; ++y) {
+        std::memcpy(&work[y * w], &background->pixels[(source.y + y) * background->width + source.x],
+                    static_cast<std::size_t>(w) * 4);
+    }
+    // One pass along rows (step 1) or columns (step w) of `count` lines.
+    auto box = [&](const std::uint32_t* from, std::uint32_t* to, int length, int lines, int step, int lineStep) {
+        const int r = kBarBlurRadius;
+        for (int line = 0; line < lines; ++line) {
+            const std::uint32_t* in = from + line * lineStep;
+            std::uint32_t* res = to + line * lineStep;
+            int sum[3] = { 0, 0, 0 };
+            for (int k = -r; k <= r; ++k) {
+                const int at = k < 0 ? 0 : k >= length ? length - 1 : k;
+                const std::uint32_t p = in[at * step];
+                sum[0] += p & 0xFF;
+                sum[1] += (p >> 8) & 0xFF;
+                sum[2] += (p >> 16) & 0xFF;
+            }
+            const int span = 2 * r + 1;
+            for (int i = 0; i < length; ++i) {
+                res[i * step] = 0xFF000000u | static_cast<std::uint32_t>(sum[0] / span) |
+                                (static_cast<std::uint32_t>(sum[1] / span) << 8) |
+                                (static_cast<std::uint32_t>(sum[2] / span) << 16);
+                const int addAt = i + r + 1 >= length ? length - 1 : i + r + 1;
+                const int dropAt = i - r < 0 ? 0 : i - r;
+                const std::uint32_t add = in[addAt * step];
+                const std::uint32_t drop = in[dropAt * step];
+                sum[0] += static_cast<int>(add & 0xFF) - static_cast<int>(drop & 0xFF);
+                sum[1] += static_cast<int>((add >> 8) & 0xFF) - static_cast<int>((drop >> 8) & 0xFF);
+                sum[2] += static_cast<int>((add >> 16) & 0xFF) - static_cast<int>((drop >> 16) & 0xFF);
+            }
+        }
+    };
+    for (int pass = 0; pass < 3; ++pass) {
+        box(work, temp, w, h, 1, w);
+        box(temp, work, h, w, w, 1);
+    }
+    for (int y = 0; y < bar.height; ++y) {
+        std::memcpy(&out[y * bar.width], &work[(bar.y - source.y + y) * w + (bar.x - source.x)],
+                    static_cast<std::size_t>(bar.width) * 4);
+    }
+    delete[] work;
+    delete[] temp;
+    background->barBlur = out;
+    background->barBlurRect = bar;
+}
+
 }  // namespace
 
 bool load_background(DesktopBackground* background, std::uint32_t width, std::uint32_t height, const char* path) {
@@ -78,6 +148,7 @@ bool load_background(DesktopBackground* background, std::uint32_t width, std::ui
     std::strncpy(background->currentPath, path, sizeof(background->currentPath) - 1);
     background->currentPath[sizeof(background->currentPath) - 1] = '\0';
     background->ready = true;
+    blur_bar_backdrop(background);
     return true;
 }
 

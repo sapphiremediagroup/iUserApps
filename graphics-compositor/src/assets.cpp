@@ -131,16 +131,58 @@ static bool load_icon(ui::Image* icon, const char* path, int size, const char* n
     return true;
 }
 
-bool TaskbarStatusAssets::load() {
-    const bool internet = load_icon(&noInternet, kTaskbarNoInternetIconPath, kTaskbarStatusIconSize, "no internet");
-    const bool sound = load_icon(&noSound, kTaskbarNoSoundIconPath, kTaskbarStatusIconSize, "no sound");
-    return internet && sound;
+
+// A /bin/icons line icon at `size`, in `color`.
+static bool load_line_icon(ui::Image* image, const char* name, int size, ui::Color color) {
+    char path[96] = {};
+    std::size_t length = 0;
+    const char* const parts[3] = { kIconDirectory, name, ".svg" };
+    for (const char* part : parts) {
+        for (std::size_t i = 0; part[i] != '\0' && length + 1 < sizeof(path); ++i) {
+            path[length++] = part[i];
+        }
+    }
+    if (!image->load_svg(path, size, size)) {
+        write_str("[graphics.compositor] icon load failed: ");
+        write_str(path);
+        write_str("\n");
+        return false;
+    }
+    image->tint(color);
+    return true;
+}
+
+bool TaskbarAssets::load() {
+    const ui::Theme& t = ui::theme();
+    static const char* const kApps[kTitleIconCount] = { "terminal", "folder", "image", "cube", "globe", "app" };
+    bool ok = true;
+    for (int a = 0; a < kTitleIconCount; ++a) {
+        ok = load_line_icon(&apps[a][0], kApps[a], kTileIconSize, t.text) && ok;
+        ok = load_line_icon(&apps[a][1], kApps[a], kTileIconSize, t.kindFile) && ok;
+    }
+    ok = load_line_icon(&wifi, "wifi", kTrayIconSize, t.kindFile) && ok;
+    ok = load_line_icon(&wifiOff, "wifi-off", kTrayIconSize, t.kindFile) && ok;
+    ok = load_line_icon(&volumeOff, "volume-x", kTrayIconSize, t.kindFile) && ok;
+    if (!startFont.load_em(kNotchBoldFontPath, 14.0f)) {
+        write_str("[graphics.compositor] start button font load failed\n");
+        ok = false;
+    }
+    return ok;
 }
 
 bool WindowControlAssets::load() {
-    const int iconSize = kControlIconSize + 6;
-    const bool closeOk = load_icon(&close, kWindowCloseIconPath, iconSize, "close");
-    const bool minimizeOk = load_icon(&minimize, kWindowMinimizeIconPath, iconSize, "minimize");
-    const bool resizeOk = load_icon(&resize, kWindowResizeIconPath, iconSize, "resize");
-    return closeOk && minimizeOk && resizeOk;
+    const ui::Theme& t = ui::theme();
+    static const char* const kGlyphs[4] = { "win-close", "win-maximize", "win-minimize", "win-restore" };
+    static const char* const kApps[kTitleIconCount] = { "terminal", "folder", "image", "cube", "globe", "app" };
+    bool ok = true;
+    for (int g = 0; g < 4; ++g) {
+        ok = load_line_icon(&glyphs[g][0], kGlyphs[g], kControlGlyphSize, t.text) && ok;
+        ok = load_line_icon(&glyphs[g][1], kGlyphs[g], kControlGlyphSize, t.textUnfocused) && ok;
+        ok = load_line_icon(&glyphs[g][2], kGlyphs[g], kControlGlyphSize, t.accentText) && ok;
+    }
+    for (int a = 0; a < kTitleIconCount; ++a) {
+        ok = load_line_icon(&apps[a][0], kApps[a], kTitleIconSize, t.accentLight) && ok;
+        ok = load_line_icon(&apps[a][1], kApps[a], kTitleIconSize, t.textUnfocused) && ok;
+    }
+    return ok;
 }

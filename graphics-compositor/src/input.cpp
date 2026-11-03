@@ -65,7 +65,7 @@ void route_pointer_to_window(const std::Event& event, const std::WindowInfo* win
         route->grabWindowId = 0;
         // The taskbar is drawn over the windows, so it is the taskbar's.
         const TaskbarLayout layout = taskbar_layout(screenWidth, screenHeight, windows, count);
-        if (taskbar_hit(layout, screenWidth, screenHeight, event.pointer.x, event.pointer.y).kind != TaskbarHitKind::None) {
+        if (taskbar_hit(layout, event.pointer.x, event.pointer.y).kind != TaskbarHitKind::None) {
             return;
         }
         const std::WindowInfo* top = top_window_at(windows, count, event.pointer.x, event.pointer.y);
@@ -92,16 +92,78 @@ Rect window_frame_rect(const std::WindowInfo& window) {
     return { window.x, window.y, frame_width(window), frame_height(window) };
 }
 
+Rect window_damage_rect(const std::WindowInfo& window) {
+    const Rect frame = window_frame_rect(window);
+    return { frame.x - kShadowMargin, frame.y - kShadowMargin, frame.width + 2 * kShadowMargin,
+             frame.height + 2 * kShadowMargin };
+}
+
+int window_control_at(const std::WindowInfo& window, int x, int y) {
+    for (int control = kControlClose; control <= kControlMinimize; ++control) {
+        if (window_control_rect(window, control).contains(x, y)) {
+            return control;
+        }
+    }
+    return -1;
+}
+
 bool pointer_on_close(const std::WindowInfo& window, int x, int y) {
-    return window_control_rect(window, 0).contains(x, y);
+    return window_control_rect(window, kControlClose).contains(x, y);
 }
 
 bool pointer_on_maximize(const std::WindowInfo& window, int x, int y) {
-    return window_control_rect(window, 1).contains(x, y);
+    return window_control_rect(window, kControlMaximize).contains(x, y);
 }
 
 bool pointer_on_minimize(const std::WindowInfo& window, int x, int y) {
-    return window_control_rect(window, 2).contains(x, y);
+    return window_control_rect(window, kControlMinimize).contains(x, y);
+}
+
+// Follows the window control under the pointer; a change repaints the old
+// and the new button.
+static void update_control_hover(const std::Event& event, const std::WindowInfo* windows, std::uint64_t windowCount,
+                                 std::uint32_t screenWidth, std::uint32_t screenHeight, const DragState* drag,
+                                 Rect* windowDirty) {
+    WindowHover hover = {};
+    const TaskbarLayout layout = taskbar_layout(screenWidth, screenHeight, windows, windowCount);
+    const TaskbarHit taskbarHit = taskbar_hit(layout, event.pointer.x, event.pointer.y);
+    // The tile under the pointer shows its tooltip.
+    const int tile = !drag->moving && !drag->resizing && taskbarHit.kind == TaskbarHitKind::Tile ? taskbarHit.tile : -1;
+    if (tile != gTaskbarHover) {
+        if (windowDirty) {
+            const Rect before = taskbar_tooltip_rect(layout, gTaskbarHover, windows, windowCount);
+            const Rect after = taskbar_tooltip_rect(layout, tile, windows, windowCount);
+            *windowDirty = windowDirty->unite(before).unite(after);
+            if (gTaskbarHover >= 0 && gTaskbarHover < layout.tileCount) {
+                *windowDirty = windowDirty->unite(layout.tiles[gTaskbarHover].rect);
+            }
+            if (tile >= 0) {
+                *windowDirty = windowDirty->unite(layout.tiles[tile].rect);
+            }
+        }
+        gTaskbarHover = tile;
+    }
+    if (!drag->moving && !drag->resizing && taskbarHit.kind == TaskbarHitKind::None) {
+        const std::WindowInfo* top = top_window_at(windows, windowCount, event.pointer.x, event.pointer.y);
+        const int control = top ? window_control_at(*top, event.pointer.x, event.pointer.y) : -1;
+        if (control >= 0) {
+            hover = { top->id, control };
+        }
+    }
+    if (hover.windowId == gWindowHover.windowId && hover.control == gWindowHover.control) {
+        return;
+    }
+    if (windowDirty) {
+        const std::WindowInfo* before = window_by_id(windows, windowCount, gWindowHover.windowId);
+        if (before) {
+            *windowDirty = windowDirty->unite(window_control_rect(*before, gWindowHover.control));
+        }
+        const std::WindowInfo* now = window_by_id(windows, windowCount, hover.windowId);
+        if (now) {
+            *windowDirty = windowDirty->unite(window_control_rect(*now, hover.control));
+        }
+    }
+    gWindowHover = hover;
 }
 
 bool pointer_on_resize_grip(const std::WindowInfo& window, int x, int y) {
@@ -150,6 +212,7 @@ bool handle_pointer_event(const std::Event& event, const std::WindowInfo* window
     }
 
     bool fullRedraw = false;
+    update_control_hover(event, windows, windowCount, screenWidth, screenHeight, drag, windowDirty);
     const std::uint16_t previousButtons = *buttons;
     *buttons = event.pointer.buttons;
     const bool leftWasDown = (previousButtons & 0x1u) != 0;
@@ -160,8 +223,8 @@ bool handle_pointer_event(const std::Event& event, const std::WindowInfo* window
         const int newX = event.pointer.x - drag->grabOffsetX;
         const int newY = event.pointer.y - drag->grabOffsetY;
         if (before && std::compositor_move_window(drag->windowId, newX, newY) != fail) {
-            const Rect oldFrame = window_frame_rect(*before);
-            const Rect newFrame = { newX, newY, oldFrame.width, oldFrame.height };
+            const Rect oldFrame = window_damage_rect(*before);
+            const Rect newFrame = oldFrame.offset(newX - before->x, newY - before->y);
             if (windowDirty) {
                 *windowDirty = windowDirty->unite(oldFrame.unite(newFrame));
             }
@@ -173,8 +236,9 @@ bool handle_pointer_event(const std::Event& event, const std::WindowInfo* window
         if (newWidth < 64) newWidth = 64;
         if (newHeight < 48) newHeight = 48;
         if (before && std::compositor_resize_window(drag->windowId, newWidth, newHeight) != fail) {
-            const Rect oldFrame = window_frame_rect(*before);
-            const Rect newFrame = { before->x, before->y, newWidth + (kBorder * 2), newHeight + kTitleBarHeight + kBorder };
+            const Rect oldFrame = window_damage_rect(*before);
+            const Rect newFrame = { oldFrame.x, oldFrame.y, newWidth + (kBorder * 2) + 2 * kShadowMargin,
+                                    newHeight + kTitleBarHeight + kBorder + 2 * kShadowMargin };
             if (windowDirty) {
                 *windowDirty = windowDirty->unite(oldFrame.unite(newFrame));
             }
@@ -184,28 +248,12 @@ bool handle_pointer_event(const std::Event& event, const std::WindowInfo* window
     if (!leftWasDown && leftIsDown) {
         // The taskbar first: it is drawn over the windows.
         const TaskbarLayout layout = taskbar_layout(screenWidth, screenHeight, windows, windowCount);
-        const TaskbarHit hit = taskbar_hit(layout, screenWidth, screenHeight, event.pointer.x, event.pointer.y);
-        if (hit.kind == TaskbarHitKind::Launcher) {
-            if (!launch_taskbar_slot(hit.slot)) {
-                write_str("[graphics.compositor] FAIL spawn taskbar slot\n");
-            }
+        const TaskbarHit hit = taskbar_hit(layout, event.pointer.x, event.pointer.y);
+        if (hit.kind == TaskbarHitKind::Tile) {
             clear_drag(drag);
-            return false;
+            return taskbar_click(layout, hit.tile, windows, windowCount);
         }
-        if (hit.kind == TaskbarHitKind::Window) {
-            // A window's button: bring it up, or minimize it if it is the
-            // focused one (focusing a minimized window restores it).
-            const std::WindowInfo* window = window_by_id(windows, windowCount, hit.windowId);
-            if (window && (window->state & std::WindowStateFocused) != 0 &&
-                (window->state & std::WindowStateMinimized) == 0) {
-                std::compositor_control_window(window->id, std::WindowControlAction::Minimize);
-            } else if (window) {
-                std::compositor_focus_window(window->id);
-            }
-            clear_drag(drag);
-            return true;
-        }
-        if (hit.kind == TaskbarHitKind::Pill) {
+        if (hit.kind != TaskbarHitKind::None) {
             clear_drag(drag);
             return false;
         }
@@ -221,11 +269,18 @@ bool handle_pointer_event(const std::Event& event, const std::WindowInfo* window
                 return true;
             }
             if (pointer_on_maximize(*window, event.pointer.x, event.pointer.y)) {
-                const std::WindowControlAction action =
-                    (window->state & std::WindowStateMaximized) != 0
-                    ? std::WindowControlAction::Restore
-                    : std::WindowControlAction::Maximize;
-                std::compositor_control_window(window->id, action);
+                if ((window->state & std::WindowStateMaximized) != 0) {
+                    std::compositor_control_window(window->id, std::WindowControlAction::Restore);
+                } else {
+                    // The frame fills the work area, 8 px in from the screen's
+                    // edges and kWorkAreaGap above the taskbar.
+                    const int frameX = 8;
+                    const int frameY = 8;
+                    const int frameWidth = static_cast<int>(screenWidth) - 16;
+                    const int frameHeight = work_area_bottom(screenHeight) - frameY;
+                    std::compositor_control_window(window->id, std::WindowControlAction::Maximize, frameX, frameY,
+                                                   frameWidth - 2 * kBorder, frameHeight - kTitleBarHeight - kBorder);
+                }
                 clear_drag(drag);
                 return true;
             }

@@ -58,6 +58,33 @@ static bool ensureGraphicsCompositor() {
     return true;
 }
 
+// A one-shot test script: when the disk's root holds /autorun.sh (F:\AUTORUN.SH
+// from Windows on the PC), it is renamed to /autorun.old, so it runs on this
+// boot only, and bash runs it once the desktop has settled. tools/pc-run.ps1
+// writes it (ending in `reboot`) and boots InstantOS once with BootNext, so
+// the restart lands back in Windows.
+static void runAutorun() {
+    std::Stat st = {};
+    if (static_cast<std::int64_t>(std::stat("/autorun.sh", &st)) < 0) {
+        return;
+    }
+    std::unlink("/autorun.old");
+    const std::uint64_t renamed = _syscall_impl(
+        static_cast<std::uint64_t>(std::Syscall::Rename),
+        reinterpret_cast<std::uint64_t>("/autorun.sh"),
+        reinterpret_cast<std::uint64_t>("/autorun.old"));
+    if (static_cast<std::int64_t>(renamed) < 0) {
+        writeStr("[login] autorun: could not rename /autorun.sh; not running it\n");
+        return;
+    }
+    std::sleep(3000);   // let the compositor, taskbar and services settle
+    writeStr("[login] autorun: running /autorun.old\n");
+    const char* const argv[] = { "/bin/bash", "/autorun.old", nullptr };
+    if (std::spawn("/bin/bash", argv) == static_cast<std::uint64_t>(-1)) {
+        writeStr("[login] autorun: could not start /bin/bash\n");
+    }
+}
+
 static char eventChar(const std::Event& event) {
     if (event.type != std::EventType::Key || event.key.action == std::KeyEventAction::Release) {
         return 0;
@@ -139,6 +166,7 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv) {
         if (result != static_cast<std::uint64_t>(-1)) {
             writeStr("Login successful.\n");
             if (ensureGraphicsCompositor()) {
+                runAutorun();
             }
             std::yield();
             std::close(inputQueue);

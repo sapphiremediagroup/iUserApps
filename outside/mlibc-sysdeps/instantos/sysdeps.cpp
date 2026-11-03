@@ -7,6 +7,7 @@
 #include <mlibc/allocator.hpp>
 #include <string.h>
 #include <time.h>
+#include <sched.h>
 #include <stdarg.h>
 #include <abi-bits/ioctls.h>
 #include <abi-bits/signal.h>
@@ -169,6 +170,13 @@ unsigned long parse_decimal(const char* value) {
     return result;
 }
 
+// <instantos/window.h>: the kernel handle behind an fd, for the InstantOS
+// calls that take handles (a dma-buf for SurfaceFromBuffer).
+extern "C" [[gnu::visibility("default")]] long instantos_fd_handle(int fd) {
+    if (fd < 0 || fd >= kMaxFd || (fdTable[fd] == 0 && fd > 2)) return -1;
+    return fdTable[fd];
+}
+
 int register_fd_min(long handle, int min) {
     if (min < 0) min = 0;
     for (int fd = min; fd < kMaxFd; ++fd) {
@@ -182,6 +190,13 @@ int register_fd_min(long handle, int min) {
 
 int register_fd(long handle) {
     return register_fd_min(handle, 3);
+}
+
+// <instantos/window.h>: a kernel handle an InstantOS call gave (a scanout
+// buffer's dma-buf) as an fd of this process; closing the fd closes it.
+extern "C" [[gnu::visibility("default")]] int instantos_handle_fd(long handle) {
+    if (handle < 0) return -1;
+    return register_fd(handle);
 }
 
 int register_fd_at(int fd, long handle) {
@@ -1006,6 +1021,35 @@ int Sysdeps<FutexWake>::operator()(int*, bool) {
     return 0;
 }
 
+// pthread_setname_np / pthread_getname_np: the kernel keeps no thread names,
+// so a name is accepted and forgotten (Mesa names its worker threads; without
+// these mlibc's __ensure fired on every one).
+int Sysdeps<ThreadSetname>::operator()(void*, const char*) {
+    return 0;
+}
+
+int Sysdeps<ThreadGetname>::operator()(void*, char* name, size_t size) {
+    if (size == 0) {
+        return ERANGE;
+    }
+    name[0] = '\0';
+    return 0;
+}
+
+// pthread_setschedparam / pthread_getschedparam: the scheduler has no
+// policies or priorities, so every thread is SCHED_OTHER at priority 0 and a
+// request for another is accepted and ignored (Mesa lowers the priority of its
+// worker threads; without these mlibc's __ensure fired).
+int Sysdeps<GetSchedparam>::operator()(void*, int* policy, struct sched_param* param) {
+    *policy = SCHED_OTHER;
+    param->sched_priority = 0;
+    return 0;
+}
+
+int Sysdeps<SetSchedparam>::operator()(void*, int, const struct sched_param*) {
+    return 0;
+}
+
 // --- Threads -------------------------------------------------------------
 //
 // mlibc's generic pthread layer drives thread creation through three sysdeps:
@@ -1077,12 +1121,127 @@ void Sysdeps<ThreadExit>::operator()() {
 
 #endif  // !MLIBC_BUILDING_RTLD
 
+namespace {
+
+// The ioctls whose structs carry fds (the GPU's: DRM 'd', sync_file '>',
+// dma-buf 'b'). The kernel's DRM code reads and writes an fd there as the
+// slot of a File handle (handle = 1 << 48 | slot: 32 bits cannot hold a
+// handle), while programs use this table's small fds: in-fds are turned
+// into slots for the call and put back, out-fds become new table entries.
+struct FdField {
+    unsigned type;      // the ioctl type byte
+    unsigned nr;        // its number
+    unsigned offset;    // of the s32 fd in the struct
+    bool out;           // written by the kernel (else read)
+};
+
+constexpr FdField kFdFields[] = {
+    {'d', 0x2d, 8, true},    // DRM_IOCTL_PRIME_HANDLE_TO_FD: drm_prime_handle.fd
+    {'d', 0x2e, 8, false},   // DRM_IOCTL_PRIME_FD_TO_HANDLE
+    {'d', 0xC1, 8, true},    // DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD: drm_syncobj_handle.fd
+    {'d', 0xC2, 8, false},   // DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE
+    {'>', 3, 32, false},     // SYNC_IOC_MERGE: sync_merge_data.fd2 ...
+    {'>', 3, 36, true},      // ... and .fence
+    {'b', 2, 4, true},       // DMA_BUF_IOCTL_EXPORT_SYNC_FILE: .fd
+    {'b', 3, 4, false},      // DMA_BUF_IOCTL_IMPORT_SYNC_FILE: .fd
+};
+
+constexpr long kFileHandleType = 1L << 48;
+constexpr unsigned kExecbuffer2Nr = 0x40 + 0x29;   // DRM_IOCTL_I915_GEM_EXECBUFFER2(_WR)
+constexpr unsigned long kExecFenceIn = 1UL << 16;
+constexpr unsigned long kExecFenceOut = 1UL << 17;
+
+// A table fd as the kernel's slot (-1 when it is not a file).
+int32_t slot_for_fd(int32_t fd) {
+    const long handle = handle_for_fd(fd);
+    if (handle <= 0 || (handle >> 48) != 1) {
+        return -1;
+    }
+    return static_cast<int32_t>(handle & 0xFFFFFFFFL);
+}
+
+// A slot the kernel handed out, as a new table fd (closed if the table is full).
+int32_t fd_for_slot(int32_t slot) {
+    if (slot < 0) {
+        return -1;
+    }
+    const long handle = kFileHandleType | slot;
+    const int fd = register_fd(handle);
+    if (fd < 0) {
+        __do_syscall1(INSTANTOS_SYS_CLOSE, handle);
+    }
+    return fd;
+}
+
+} // namespace
+
 int Sysdeps<Ioctl>::operator()(int fd, unsigned long request, void* arg, int* result) {
     long handle = handle_for_fd(fd);
     if (handle < 0) return EBADF;
+    const unsigned type = (request >> 8) & 0xFF;
+    const unsigned nr = request & 0xFF;
+    auto* bytes = static_cast<unsigned char*>(arg);
+
+    // In-fds become slots for the call.
+    int32_t saved[2] = {0, 0};
+    int savedCount = 0;
+    const FdField* fields[2] = {nullptr, nullptr};
+    if (bytes) {
+        for (const FdField& f : kFdFields) {
+            if (f.type != type || f.nr != nr || savedCount == 2) continue;
+            fields[savedCount] = &f;
+            int32_t value;
+            memcpy(&value, bytes + f.offset, sizeof(value));
+            saved[savedCount++] = value;
+            if (!f.out) {
+                const int32_t slot = slot_for_fd(value);
+                memcpy(bytes + f.offset, &slot, sizeof(slot));
+            }
+        }
+    }
+    // Execbuffer: FENCE_IN in rsvd2's low half, FENCE_OUT back in its high half.
+    const bool execbuffer = bytes && type == 'd' && nr == kExecbuffer2Nr;
+    unsigned long execFlags = 0;
+    uint64_t rsvd2 = 0;
+    if (execbuffer) {
+        memcpy(&execFlags, bytes + 40, sizeof(execFlags));
+        memcpy(&rsvd2, bytes + 56, sizeof(rsvd2));
+        if (execFlags & kExecFenceIn) {
+            const int32_t slot = slot_for_fd(static_cast<int32_t>(rsvd2 & 0xFFFFFFFFu));
+            const uint64_t translated = (rsvd2 & ~0xFFFFFFFFull) | static_cast<uint32_t>(slot);
+            memcpy(bytes + 56, &translated, sizeof(translated));
+        }
+    }
+
     long ret = __do_syscall3(INSTANTOS_SYS_IOCTL, handle, static_cast<long>(request),
                              reinterpret_cast<long>(arg));
-    if (int e = sc_error(ret); e) return e;
+    const int error = sc_error(ret);
+
+    for (int i = 0; i < savedCount; ++i) {
+        if (!fields[i]->out) {
+            memcpy(bytes + fields[i]->offset, &saved[i], sizeof(saved[i]));   // the caller's fd, as it was
+        } else if (!error) {
+            int32_t slot;
+            memcpy(&slot, bytes + fields[i]->offset, sizeof(slot));
+            const int32_t local = fd_for_slot(slot);
+            memcpy(bytes + fields[i]->offset, &local, sizeof(local));
+            if (local < 0) return EMFILE;
+        }
+    }
+    if (execbuffer) {
+        uint64_t after;
+        memcpy(&after, bytes + 56, sizeof(after));
+        after = (after & ~0xFFFFFFFFull) | (rsvd2 & 0xFFFFFFFFull);   // FENCE_IN's fd as it was
+        if (!error && (execFlags & kExecFenceOut)) {
+            const int32_t local = fd_for_slot(static_cast<int32_t>(after >> 32));
+            after = (after & 0xFFFFFFFFull) | (static_cast<uint64_t>(static_cast<uint32_t>(local)) << 32);
+            memcpy(bytes + 56, &after, sizeof(after));
+            if (local < 0) return EMFILE;
+        } else {
+            memcpy(bytes + 56, &after, sizeof(after));
+        }
+    }
+    if (error) return error;
     if (result) *result = static_cast<int>(ret);
     return 0;
 }
@@ -1838,6 +1997,137 @@ long socket_recv_one(long handle, void* buffer, size_t size, int flags,
     return ret;
 }
 
+
+// AF_UNIX: SocketSendMsg/SocketRecvMsg take one flat buffer plus kernel
+// handles (SCM_RIGHTS). Other sockets answer EOPNOTSUPP, and the callers go
+// on with Send/SendTo/Recv as before.
+struct instantos_socket_message {
+    unsigned long buffer;
+    unsigned long length;
+    unsigned long handles;
+    unsigned int handleCount;
+    unsigned int flags;
+};
+
+constexpr int kMaxPassedFds = 253;   // SCM_MAX_FD
+
+size_t iov_total(const struct msghdr* hdr) {
+    size_t size = 0;
+    for (int i = 0; i < hdr->msg_iovlen; ++i) size += hdr->msg_iov[i].iov_len;
+    return size;
+}
+
+// -1: not an AF_UNIX socket (use the old path); else 0 or an errno.
+int unix_msg_send(long handle, const struct msghdr* hdr, int flags, ssize_t* length) {
+    long handles[kMaxPassedFds];
+    unsigned int count = 0;
+    if (hdr->msg_control && hdr->msg_controllen >= sizeof(struct cmsghdr)) {
+        auto* h = const_cast<struct msghdr*>(hdr);
+        for (struct cmsghdr* c = CMSG_FIRSTHDR(h); c; c = CMSG_NXTHDR(h, c)) {
+            if (c->cmsg_level != SOL_SOCKET || c->cmsg_type != SCM_RIGHTS) continue;
+            const size_t n = (c->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+            const int* fds = reinterpret_cast<const int*>(CMSG_DATA(c));
+            for (size_t i = 0; i < n; ++i) {
+                if (count == kMaxPassedFds) return EINVAL;
+                if (fds[i] < 0 || fds[i] >= kMaxFd || (fdTable[fds[i]] == 0 && fds[i] > 2)) return EBADF;
+                handles[count++] = handle_for_fd(fds[i]);
+            }
+        }
+    }
+    const size_t size = iov_total(hdr);
+    const void* data = hdr->msg_iovlen == 1 ? hdr->msg_iov[0].iov_base : nullptr;
+    char* bounce = nullptr;
+    if (!data && size != 0) {
+        bounce = static_cast<char*>(getAllocator().allocate(size));
+        if (!bounce) return ENOMEM;
+        size_t off = 0;
+        for (int i = 0; i < hdr->msg_iovlen; ++i) {
+            memcpy(bounce + off, hdr->msg_iov[i].iov_base, hdr->msg_iov[i].iov_len);
+            off += hdr->msg_iov[i].iov_len;
+        }
+        data = bounce;
+    }
+    instantos_socket_message m;
+    m.buffer = reinterpret_cast<unsigned long>(data);
+    m.length = size;
+    m.handles = reinterpret_cast<unsigned long>(handles);
+    m.handleCount = count;
+    m.flags = 0;
+    long ret = __do_syscall3(INSTANTOS_SYS_SOCKET_SENDMSG, handle, reinterpret_cast<long>(&m), flags);
+    if (bounce) getAllocator().free(bounce);
+    int e = sc_error(ret);
+    if (e == EOPNOTSUPP) return count ? EINVAL : -1;   // SCM_RIGHTS on an IPv4 socket
+    if (e) return e;
+    if (length) *length = ret;
+    return 0;
+}
+
+int unix_msg_recv(long handle, struct msghdr* hdr, int flags, ssize_t* length) {
+    const size_t size = iov_total(hdr);
+    void* target = hdr->msg_iovlen == 1 ? hdr->msg_iov[0].iov_base : nullptr;
+    char* bounce = nullptr;
+    if (!target && size != 0) {
+        bounce = static_cast<char*>(getAllocator().allocate(size));
+        if (!bounce) return ENOMEM;
+        target = bounce;
+    }
+    unsigned int capacity = 0;
+    if (hdr->msg_control && hdr->msg_controllen >= CMSG_LEN(sizeof(int))) {
+        capacity = (hdr->msg_controllen - CMSG_LEN(0)) / sizeof(int);
+        if (capacity > kMaxPassedFds) capacity = kMaxPassedFds;
+    }
+    long handles[kMaxPassedFds];
+    instantos_socket_message m;
+    m.buffer = reinterpret_cast<unsigned long>(target);
+    m.length = size;
+    m.handles = reinterpret_cast<unsigned long>(handles);
+    m.handleCount = capacity;
+    m.flags = 0;
+    long ret = __do_syscall3(INSTANTOS_SYS_SOCKET_RECVMSG, handle, reinterpret_cast<long>(&m), flags);
+    int e = sc_error(ret);
+    if (e) {
+        if (bounce) getAllocator().free(bounce);
+        return e == EOPNOTSUPP ? -1 : e;
+    }
+    if (bounce) {
+        size_t off = 0;
+        for (int i = 0; i < hdr->msg_iovlen && off < static_cast<size_t>(ret); ++i) {
+            size_t n = hdr->msg_iov[i].iov_len;
+            if (n > static_cast<size_t>(ret) - off) n = static_cast<size_t>(ret) - off;
+            memcpy(hdr->msg_iov[i].iov_base, bounce + off, n);
+            off += n;
+        }
+        getAllocator().free(bounce);
+    }
+    int msgFlags = static_cast<int>(m.flags);
+    size_t controlUsed = 0;
+    if (m.handleCount != 0) {
+        struct cmsghdr* c = CMSG_FIRSTHDR(hdr);
+        int* fds = reinterpret_cast<int*>(CMSG_DATA(c));
+        unsigned int registered = 0;
+        for (unsigned int i = 0; i < m.handleCount; ++i) {
+            int fd = register_fd(handles[i]);
+            if (fd < 0) {
+                __do_syscall1(INSTANTOS_SYS_CLOSE, handles[i]);
+                msgFlags |= MSG_CTRUNC;
+                continue;
+            }
+            fds[registered++] = fd;
+        }
+        if (registered != 0) {
+            c->cmsg_level = SOL_SOCKET;
+            c->cmsg_type = SCM_RIGHTS;
+            c->cmsg_len = CMSG_LEN(registered * sizeof(int));
+            controlUsed = CMSG_SPACE(registered * sizeof(int));
+            if (controlUsed > hdr->msg_controllen) controlUsed = hdr->msg_controllen;
+        }
+    }
+    hdr->msg_controllen = controlUsed;
+    hdr->msg_namelen = 0;
+    hdr->msg_flags = msgFlags;
+    if (length) *length = ret;
+    return 0;
+}
 }  // namespace
 
 int Sysdeps<Socket>::operator()(int family, int type, int protocol, int* fd) {
@@ -1973,6 +2263,7 @@ int Sysdeps<Recvfrom>::operator()(int fd, void* buffer, size_t size, int flags,
 int Sysdeps<MsgSend>::operator()(int fd, const struct msghdr* hdr, int flags, ssize_t* length) {
     long handle = handle_for_fd(fd);
     if (handle < 0) return EBADF;
+    if (int u = unix_msg_send(handle, hdr, flags, length); u >= 0) return u;
     const auto* dest = static_cast<const struct sockaddr*>(hdr->msg_name);
 
     if (socket_is_datagram(handle)) {
@@ -2019,6 +2310,7 @@ int Sysdeps<MsgSend>::operator()(int fd, const struct msghdr* hdr, int flags, ss
 int Sysdeps<MsgRecv>::operator()(int fd, struct msghdr* hdr, int flags, ssize_t* length) {
     long handle = handle_for_fd(fd);
     if (handle < 0) return EBADF;
+    if (int u = unix_msg_recv(handle, hdr, flags, length); u >= 0) return u;
 
     if (socket_is_datagram(handle)) {
         size_t size = 0;
@@ -2074,6 +2366,24 @@ int Sysdeps<MsgRecv>::operator()(int fd, struct msghdr* hdr, int flags, ssize_t*
     hdr->msg_controllen = 0;
     hdr->msg_flags = 0;
     if (length) *length = total;
+    return 0;
+}
+
+int Sysdeps<Socketpair>::operator()(int domain, int type_and_flags, int proto, int* fds) {
+    long handles[2] = {0, 0};
+    long ret = __do_syscall4(INSTANTOS_SYS_SOCKETPAIR, domain, type_and_flags, proto,
+                             reinterpret_cast<long>(handles));
+    if (int e = sc_error(ret); e) return e;
+    int a = register_fd(handles[0]);
+    int b = a >= 0 ? register_fd(handles[1]) : -1;
+    if (a < 0 || b < 0) {
+        if (a >= 0) fdTable[a] = 0;
+        __do_syscall1(INSTANTOS_SYS_CLOSE, handles[0]);
+        __do_syscall1(INSTANTOS_SYS_CLOSE, handles[1]);
+        return EMFILE;
+    }
+    fds[0] = a;
+    fds[1] = b;
     return 0;
 }
 

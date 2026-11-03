@@ -1,1 +1,1 @@
-add_instant_window_app(file-browser)
+add_user_app(file-browser)

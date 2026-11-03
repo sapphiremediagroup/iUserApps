@@ -22,6 +22,10 @@ struct InstantosSysdepTags :
 	FutexWake,
 	PrepareStack,
 	Clone,
+	ThreadSetname,
+	ThreadGetname,
+	GetSchedparam,
+	SetSchedparam,
 	ThreadExit,
 	Open,
 	Read,
@@ -93,6 +97,7 @@ struct InstantosSysdepTags :
 	Recvfrom,
 	MsgSend,
 	MsgRecv,
+	Socketpair,
 	GetHostname,
 
 	// --- Process / signals ---

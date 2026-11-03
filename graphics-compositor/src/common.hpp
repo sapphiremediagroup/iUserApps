@@ -13,6 +13,7 @@
 #include <syscall.hpp>
 #include <time.hpp>
 #include <ui/graphics.hpp>
+#include <ui/theme.hpp>
 
 #ifdef NULL
 #undef NULL
@@ -24,73 +25,51 @@ constexpr std::uint32_t kFrameIntervalMs = 16;
 constexpr std::uint32_t kCompositorBufferCount = 3;
 constexpr std::uint32_t kBackground = 0x00101820;
 constexpr std::uint32_t kBackgroundBottom = 0x001d2b3a;
-constexpr std::uint32_t kWindowBackground = 0x00f3f5f7;
-constexpr std::uint32_t kWindowBorder = 0x00191c20;
-constexpr std::uint32_t kWindowBorderFocused = 0x002a3038;
-constexpr std::uint32_t kTitleBar = 0x00101010;
-constexpr std::uint32_t kTitleBarFocused = 0x00101010;
-constexpr std::uint32_t kTitleBarHighlight = 0x00222428;
-constexpr std::uint32_t kButtonClose = 0x00ff5f57;
-constexpr std::uint32_t kButtonMin = 0x00ffbd2e;
-constexpr std::uint32_t kButtonMax = 0x0028c840;
-constexpr std::uint32_t kResizeGrip = 0x00556777;
 constexpr std::uint32_t kTitleText = 0x00f2f5f7;
-constexpr std::uint32_t kTaskbarColor = 0x00101010;
+// Window frames (CLAUDE.md "Base program style"): one rounded surface with a
+// hairline border, a 40 px title bar holding the app's icon and name, the
+// controls on the right, and a soft shadow reaching kShadowMargin past it.
 constexpr int kBorder = 1;
-constexpr int kTitleBarHeight = 34;
-constexpr int kWindowCornerRadius = 18;
-constexpr int kButtonSize = 28;
-constexpr int kButtonGap = 4;
-constexpr int kButtonMarginLeft = 14;
-constexpr int kControlIconSize = 10;
+constexpr int kTitleBarHeight = 40;
+constexpr int kWindowCornerRadius = 12;
+constexpr int kControlWidth = 46;
+constexpr int kControlGlyphSize = 12;
+constexpr int kTitleIconSize = 16;
+constexpr int kTitleIconX = 14;
+constexpr int kTitleTextX = 38;
+constexpr int kShadowBlur = 24;
+constexpr int kShadowOffsetY = 10;
+constexpr int kShadowMargin = kShadowBlur + kShadowOffsetY;
+constexpr int kTitleIconCount = 6;   // terminal, folder, image, cube, globe, app
+
+// The taskbar: one floating bar kTaskbarMargin from the screen's sides and
+// bottom. Start button on the left, app tiles centred (the pinned apps, then
+// a tile per window of any other app), the tray and clock on the right.
+// Windows stay kWorkAreaGap above it.
+constexpr int kTaskbarHeight = 52;
+constexpr int kTaskbarMargin = 12;
+constexpr int kTaskbarRadius = 14;
+constexpr int kWorkAreaGap = 12;
+constexpr int kStartSize = 36;
+constexpr int kStartRadius = 10;
+constexpr int kTileSize = 44;
+constexpr int kTileGap = 6;
+constexpr int kTileRadius = 10;
+constexpr int kTileIconSize = 22;
+constexpr int kTrayIconSize = 18;
+constexpr int kTooltipHeight = 26;
+constexpr int kPinnedCount = 5;
+constexpr int kMaxTiles = 16;
+constexpr int kBarBlurRadius = 10;
+constexpr char kNotchBoldFontPath[] = "/bin/StackSansNotch-Bold.ttf";
 constexpr int kResizeGripSize = 14;
-constexpr int kTaskbarWidth = 230;
-constexpr int kTaskbarCenterWidth = 420;
-constexpr int kTaskbarCenterSlotCount = 5;
-constexpr int kTaskbarHeight = 66;
-constexpr int kTaskbarMarginX = 30;
-constexpr int kTaskbarBottomMargin = 25;
-constexpr int kTaskbarCornerRadius = 25;
-constexpr int kTaskbarBrandOffsetX = 32;
-constexpr int kTaskbarBrandWidth = 123;
-constexpr int kTaskbarBrandHeight = 34;
-constexpr int kTaskbarStatusIconSize = 32;
-constexpr int kTaskbarStatusNoInternetOffsetX = 18;
-constexpr int kTaskbarStatusNoSoundOffsetX = 62;
-constexpr int kTaskbarClockRightPadding = 24;
-constexpr int kTaskbarClockTimeBaselineOffsetY = 5 + 25;
-constexpr int kTaskbarClockDateBaselineOffsetY = 36 + 15;
-// The centre pill: the launchers, then a button per open window. It grows
-// with the windows up to the room between the side pills (kTaskbarGap from
-// each), the buttons shrinking down to their minimum, then the launchers.
-constexpr int kTaskbarGap = 16;
-constexpr int kTaskbarLauncherWidth = kTaskbarCenterWidth / kTaskbarCenterSlotCount;
-constexpr int kTaskbarLauncherMinWidth = 66;
-constexpr int kTaskbarDividerWidth = 17;
-constexpr int kTaskbarWindowButtonWidth = 150;
-constexpr int kTaskbarWindowButtonMinWidth = 56;
-constexpr int kTaskbarWindowsEndPadding = 10;
-constexpr int kTaskbarMaxWindowButtons = 16;
-constexpr std::uint32_t kTaskbarButtonFocused = 0x00303540;
-constexpr std::uint32_t kTaskbarDimText = 0x00848a92;
-constexpr std::uint32_t kTaskbarDivider = 0x00383c42;
-constexpr std::uint32_t kTaskbarRunningMark = 0x00aab4c0;
 constexpr std::uint64_t kMaxWindows = 64;
 constexpr std::uint64_t kMaxSurfaceCache = 64;
-constexpr char kClockTimeFontPath[] = "/bin/StackSansNotch-Regular.ttf";
-constexpr char kClockDateFontPath[] = "/bin/StackSansNotch-ExtraLight.ttf";
 constexpr char kBackgroundDirectory[] = "/bin/backgrounds";
 constexpr char kDefaultBackground[] = "/bin/backgrounds/instantos_2.png";
 constexpr char kDefaultCursorPath[] = "/bin/cursors/default.png";
-constexpr char kTaskbarBrandPath[] = "/bin/images/InstantOS_sapph.png";
-constexpr char kTaskbarNoInternetIconPath[] = "/bin/images/no_itnernet.png";
-constexpr char kTaskbarNoSoundIconPath[] = "/bin/images/no_sound.png";
-constexpr char kWindowCloseIconPath[] = "/bin/images/close.png";
-constexpr char kWindowMinimizeIconPath[] = "/bin/images/minimize.png";
-constexpr char kWindowResizeIconPath[] = "/bin/images/resize.png";
+constexpr char kIconDirectory[] = "/bin/icons/";
 constexpr int kMaxCursorSize = 24;
-constexpr std::uint32_t kClockTimeFontPixelHeight = 26;
-constexpr std::uint32_t kClockDateFontPixelHeight = 18;
 
 struct CursorState {
     int x;
@@ -99,23 +78,26 @@ struct CursorState {
 
 using ui::Rect;
 
-// Where the centre pill's launchers and window buttons are; windowIds are
-// the open windows in the order they were opened.
-struct TaskbarLayout {
-    Rect center;
-    int launcherWidth;
-    int windowsX;
-    int windowWidth;
-    int windowCount;
-    std::uint64_t windowIds[kTaskbarMaxWindowButtons];
+// Where the taskbar's parts are. Tiles 0..kPinnedCount-1 are the pinned
+// apps; the rest stand for one window each, oldest first.
+struct TaskbarTile {
+    Rect rect;
+    int slot;                  // the pinned app, or -1
+    std::uint64_t windowId;    // the window an unpinned tile stands for
 };
 
-enum class TaskbarHitKind { None, Pill, Launcher, Window };
+struct TaskbarLayout {
+    Rect bar;
+    Rect start;
+    int tileCount;
+    TaskbarTile tiles[kMaxTiles];
+};
+
+enum class TaskbarHitKind { None, Bar, Start, Tile };
 
 struct TaskbarHit {
     TaskbarHitKind kind;
-    int slot;
-    std::uint64_t windowId;
+    int tile;
 };
 
 // Where pointer input goes: a press inside a window's content holds the
@@ -153,20 +135,40 @@ struct CursorImage {
     bool ready() const { return image.valid(); }
 };
 
+// Window controls: 0 close, 1 maximize, 2 minimize (and 3, the restore
+// glyph a maximized window shows instead of maximize).
+enum WindowControl { kControlClose = 0, kControlMaximize = 1, kControlMinimize = 2, kControlRestore = 3 };
+
 struct WindowControlAssets {
-    ui::Image close;
-    ui::Image minimize;
-    ui::Image resize;
+    // glyphs[control][0 focused, 1 unfocused, 2 white on the red close].
+    ui::Image glyphs[4][3];
+    // The app icon a title bar shows, picked by title: [icon][0 focused, 1 unfocused].
+    ui::Image apps[kTitleIconCount][2];
 
     bool load();
 };
 
-struct TaskbarStatusAssets {
-    ui::Image noInternet;
-    ui::Image noSound;
+struct TaskbarAssets {
+    // The app icons at tile size: [icon][0 open, 1 not running].
+    ui::Image apps[kTitleIconCount][2];
+    ui::Image wifi;
+    ui::Image wifiOff;
+    ui::Image volumeOff;
+    ui::Font startFont;   // the start button's "IO"
 
     bool load();
 };
+
+// The taskbar tile under the pointer (-1: none); it shows a tooltip.
+extern int gTaskbarHover;
+
+// The window control under the pointer (drawn highlighted).
+struct WindowHover {
+    std::uint64_t windowId;   // 0: none
+    int control;
+};
+extern WindowHover gWindowHover;
+
 
 // The scene is drawn into one of these in turn, then presented.
 struct TripleBufferState {
@@ -193,7 +195,13 @@ struct SurfaceCacheEntry {
     std::uint32_t dirtyY;
     std::uint32_t dirtyWidth;
     std::uint32_t dirtyHeight;
+    std::uint64_t generation;   // commits seen since the surface appeared
+    std::uint32_t unshownLists; // window lists in a row that did not show it
 };
+
+// Window lists a surface may go unshown (and uncommitted) before its entry
+// is dropped (forget_unshown_surfaces).
+constexpr std::uint32_t kSurfaceForgetLists = 8;
 
 struct DesktopBackground {
     std::uint32_t* pixels;
@@ -201,6 +209,9 @@ struct DesktopBackground {
     std::uint32_t height;
     bool ready;
     char currentPath[192];
+    // The wallpaper under the taskbar, blurred (taskbar_bar_rect's size).
+    std::uint32_t* barBlur;
+    Rect barBlurRect;
 };
 
 struct CompositorTimingCounters {
@@ -210,12 +221,12 @@ struct CompositorTimingCounters {
     std::uint64_t sceneRedrawMs;
     std::uint64_t presentMs;
     std::uint64_t frames;
+    std::uint64_t flipWaitMs;   // flip backend: waiting for the back buffer to leave the screen
+    std::uint64_t flips;
 };
 
 extern std::WindowInfo gWindowsScratch[kMaxWindows];
 extern SurfaceCacheEntry gSurfaceCache[kMaxSurfaceCache];
-extern ui::Font gClockTimeFont;
-extern ui::Font gClockDateFont;
 extern CompositorTimingCounters gTiming;
 
 void write_str(const char* s);
@@ -268,18 +279,25 @@ void clear_surface_dirty_flags(SurfaceCacheEntry* cache);
 
 int window_control_slot_from_left(int control);
 Rect window_control_rect(const std::WindowInfo& window, int control);
-void draw_window_control_icon_fallback(ui::Canvas& canvas, const Rect& rect, int control, bool maximized);
-void draw_window_control_icon(ui::Canvas& canvas, const Rect& rect, int control, bool maximized, const WindowControlAssets* controls);
+int title_icon_index(const char* title);
 void draw_window_frame(ui::Canvas& canvas, const std::WindowInfo& window, const WindowControlAssets* controls);
+void draw_window_title(ui::Canvas& canvas, const std::WindowInfo& window, const WindowControlAssets* controls);
 void blit_window_surface(ui::Canvas& canvas, const std::WindowInfo& window, const SurfaceCacheEntry* surfaceEntry);
 
-Rect taskbar_rect_at(std::uint32_t screenWidth, std::uint32_t screenHeight, int index);
+Rect taskbar_bar_rect(std::uint32_t screenWidth, std::uint32_t screenHeight);
+// The lowest a window's frame may reach.
+int work_area_bottom(std::uint32_t screenHeight);
 TaskbarLayout taskbar_layout(std::uint32_t screenWidth, std::uint32_t screenHeight, const std::WindowInfo* windows, std::uint64_t windowCount);
-TaskbarHit taskbar_hit(const TaskbarLayout& layout, std::uint32_t screenWidth, std::uint32_t screenHeight, int x, int y);
+TaskbarHit taskbar_hit(const TaskbarLayout& layout, int x, int y);
+// A tile's tooltip, above it (empty for -1).
+Rect taskbar_tooltip_rect(const TaskbarLayout& layout, int tile, const std::WindowInfo* windows, std::uint64_t windowCount);
+// A click on a tile: focus or minimize its app's window, or start the app.
+// True when windows changed.
+bool taskbar_click(const TaskbarLayout& layout, int tile, const std::WindowInfo* windows, std::uint64_t windowCount);
 bool launch_taskbar_slot(int slot);
-void draw_taskbar(ui::Canvas& canvas, const std::WindowInfo* windows, std::uint64_t windowCount, const ui::Image* brandImage, const TaskbarStatusAssets* statusIcons);
-void redraw_scene(ui::Canvas& canvas, const std::WindowInfo* windows, std::uint64_t windowCount, SurfaceCacheEntry* cache, const DesktopBackground* background, const ui::Image* brandImage, const TaskbarStatusAssets* statusIcons, const WindowControlAssets* controls);
-void redraw_scene_rect(ui::Canvas& canvas, const std::WindowInfo* windows, std::uint64_t windowCount, SurfaceCacheEntry* cache, const DesktopBackground* background, const Rect& dirty, const ui::Image* brandImage, const TaskbarStatusAssets* statusIcons, const WindowControlAssets* controls);
+void draw_taskbar(ui::Canvas& canvas, const std::WindowInfo* windows, std::uint64_t windowCount, const TaskbarAssets* assets, const DesktopBackground* background);
+void redraw_scene(ui::Canvas& canvas, const std::WindowInfo* windows, std::uint64_t windowCount, SurfaceCacheEntry* cache, const DesktopBackground* background, const TaskbarAssets* taskbar, const WindowControlAssets* controls);
+void redraw_scene_rect(ui::Canvas& canvas, const std::WindowInfo* windows, std::uint64_t windowCount, SurfaceCacheEntry* cache, const DesktopBackground* background, const Rect& dirty, const TaskbarAssets* taskbar, const WindowControlAssets* controls);
 
 const std::WindowInfo* top_window_at(const std::WindowInfo* windows, std::uint64_t count, int x, int y);
 void route_pointer_to_window(const std::Event& event, const std::WindowInfo* windows, std::uint64_t count,
@@ -287,6 +305,10 @@ void route_pointer_to_window(const std::Event& event, const std::WindowInfo* win
                              const DragState& drag, PointerRoute* route);
 const std::WindowInfo* window_by_id(const std::WindowInfo* windows, std::uint64_t count, std::uint64_t id);
 Rect window_frame_rect(const std::WindowInfo& window);
+// The frame and its shadow: what must be repainted when the window moves.
+Rect window_damage_rect(const std::WindowInfo& window);
+// The control (WindowControl) at a point of the window, or -1.
+int window_control_at(const std::WindowInfo& window, int x, int y);
 bool pointer_on_close(const std::WindowInfo& window, int x, int y);
 bool pointer_on_maximize(const std::WindowInfo& window, int x, int y);
 bool pointer_on_minimize(const std::WindowInfo& window, int x, int y);
