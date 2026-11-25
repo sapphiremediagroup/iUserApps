@@ -40,7 +40,7 @@ constexpr int kTitleTextX = 38;
 constexpr int kShadowBlur = 24;
 constexpr int kShadowOffsetY = 10;
 constexpr int kShadowMargin = kShadowBlur + kShadowOffsetY;
-constexpr int kTitleIconCount = 6;   // terminal, folder, image, cube, globe, app
+constexpr int kTitleIconCount = 7;   // terminal, folder, image, cube, globe, notepad, app
 
 // The taskbar: one floating bar kTaskbarMargin from the screen's sides and
 // bottom. Start button on the left, app tiles centred (the pinned apps, then

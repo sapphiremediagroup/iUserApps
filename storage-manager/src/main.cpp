@@ -127,6 +127,13 @@ int main(int argc, char** argv)
         if ((iteration % 1000) == 0) {
             print_storage_info();
         }
+        // About once a second: commit ext4 metadata that has waited its
+        // interval (the driver commits busy volumes itself; this covers the
+        // last changes before the system goes quiet).
+        if ((iteration % 100) == 0) {
+            _syscall_impl(static_cast<std::uint64_t>(std::Syscall::StorageSync),
+                          static_cast<std::uint64_t>(std::StorageSyncMode::Due));
+        }
 
         _syscall_impl(static_cast<std::uint64_t>(std::Syscall::Sleep), 10);
     }

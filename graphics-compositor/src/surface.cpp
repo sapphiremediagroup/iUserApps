@@ -142,7 +142,7 @@ Rect window_control_rect(const std::WindowInfo& window, int control) {
 
 int title_icon_index(const char* title) {
     static const char* const kTitles[kTitleIconCount - 1] = { "Terminal", "File Browser", "Background Switcher",
-                                                               "Cube", "NetSurf" };
+                                                               "Cube", "NetSurf", "Notepad" };
     for (int i = 0; i < kTitleIconCount - 1; ++i) {
         if (std::strcmp(title, kTitles[i]) == 0) {
             return i;

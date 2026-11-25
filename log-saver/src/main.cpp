@@ -3,7 +3,8 @@
 // times a second (the file stays open; rewriting it whole each time was slow
 // enough on FAT32 to fall far behind), so after a hang it lacks at most the
 // last quarter second. The previous boot's copy is kept as /previous.log. The
-// kernel starts it only when it mounted an InstantOS data partition.
+// kernel starts it only when it mounted an InstantOS data partition. On an
+// installed system (instant-install made /test/logs) both live in /test/logs.
 
 #include <cstdint.hpp>
 #include <cstring.hpp>
@@ -15,8 +16,9 @@ constexpr std::uint64_t fail = static_cast<std::uint64_t>(-1);
 constexpr std::uint64_t kLogSize = 128 * 1024;
 constexpr std::uint64_t kIntervalMs = 250;
 constexpr std::uint64_t kHeartbeatRounds = 4;   // one a second
-constexpr char kLogPath[] = "/kernel.log";
-constexpr char kPreviousPath[] = "/previous.log";   // 8.3: the FAT32 driver writes short names
+// 8.3 names: the FAT32 driver writes short names only.
+const char* kLogPath = "/kernel.log";
+const char* kPreviousPath = "/previous.log";
 
 char gLog[kLogSize];
 char gCopy[kLogSize];
@@ -97,10 +99,15 @@ std::int64_t new_lines_start(const char* current, std::uint64_t size, const char
 }  // namespace
 
 int main(int, char**) {
+    std::Stat st = {};
+    if (static_cast<std::int64_t>(std::stat("/test/logs", &st)) >= 0) {
+        kLogPath = "/test/logs/kernel.log";
+        kPreviousPath = "/test/logs/previous.log";
+    }
     keep_previous();
     const std::Handle file = std::open(kLogPath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (file == fail) {
-        write_str("[log-saver] cannot open /kernel.log\n");
+        write_str("[log-saver] cannot open the log file\n");
         return 1;
     }
     std::uint64_t saved = 0;     // bytes of gCopy (the ring as last written)
@@ -141,7 +148,7 @@ int main(int, char**) {
                 std::memcpy(gCopy, gLog, size);
                 saved = size;
             } else if (++failures <= 3) {
-                write_str("[log-saver] cannot write /kernel.log, will retry\n");
+                write_str("[log-saver] cannot write the log file, will retry\n");
             }
         }
         std::sleep(kIntervalMs);

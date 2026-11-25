@@ -1,6 +1,7 @@
 // What the network tools need from InstantOS beyond POSIX: the interface
 // configuration syscalls (NetGetConfig/NetSetConfig) and their NetConfig
-// struct, mirrored from include/cpu/syscall/syscall.hpp, and KernelLog (dmesg).
+// struct, mirrored from include/cpu/syscall/syscall.hpp, KernelLog (dmesg) and
+// the driver modules (lsmod, modload).
 #pragma once
 
 #include <stdint.h>
@@ -11,7 +12,42 @@ enum {
     INSTANTOS_SYS_NET_GET_CONFIG = 141,
     INSTANTOS_SYS_NET_SET_CONFIG = 142,
     INSTANTOS_SYS_KERNEL_LOG = 151,
+    INSTANTOS_SYS_MODULE_LIST = 163,
+    INSTANTOS_SYS_MODULE_LOAD = 164,
+    INSTANTOS_SYS_PARTITION_LIST = 165,
+    INSTANTOS_SYS_PARTITION_SET_TYPE = 166,
+    INSTANTOS_SYS_PARTITION_MOUNT = 167,
 };
+
+// PartitionList's records (instant-install), mirrored from struct
+// PartitionRecord in include/cpu/syscall/syscall.hpp.
+struct partition_record {
+    uint32_t disk;
+    uint32_t index;
+    uint64_t start_byte;
+    uint64_t length_byte;
+    uint8_t type_guid[16];
+    uint8_t unique_guid[16];
+    char name[40];
+    uint32_t flags;
+    uint32_t reserved;
+};
+enum { PARTITION_INSTANTOS = 1u << 0, PARTITION_ESP = 1u << 1, PARTITION_MOUNTED = 1u << 2 };
+
+// ModuleList's records (lsmod), mirrored from struct ModuleInfo in
+// include/cpu/syscall/syscall.hpp.
+struct module_info {
+    char name[32];
+    char version[16];
+    char description[80];
+    char source[96];
+    uint64_t base;
+    uint32_t image_size;
+    uint32_t devices;
+    uint32_t relocations;
+    uint32_t flags;
+};
+enum { MODULE_INIT_FAILED = 1u << 0, MODULE_AT_BOOT = 1u << 1 };
 
 #define NET_CONFIG_MAX_DNS 3
 #define NET_CONFIG_DOMAIN_SIZE 64

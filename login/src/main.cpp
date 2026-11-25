@@ -80,7 +80,8 @@ static void runAutorun() {
     std::sleep(3000);   // let the compositor, taskbar and services settle
     writeStr("[login] autorun: running /autorun.old\n");
     const char* const argv[] = { "/bin/bash", "/autorun.old", nullptr };
-    if (std::spawn("/bin/bash", argv) == static_cast<std::uint64_t>(-1)) {
+    const char* const env[] = { "PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin", nullptr };
+    if (std::spawn("/bin/bash", argv, env) == static_cast<std::uint64_t>(-1)) {
         writeStr("[login] autorun: could not start /bin/bash\n");
     }
 }

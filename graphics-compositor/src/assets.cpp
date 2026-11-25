@@ -154,7 +154,7 @@ static bool load_line_icon(ui::Image* image, const char* name, int size, ui::Col
 
 bool TaskbarAssets::load() {
     const ui::Theme& t = ui::theme();
-    static const char* const kApps[kTitleIconCount] = { "terminal", "folder", "image", "cube", "globe", "app" };
+    static const char* const kApps[kTitleIconCount] = { "terminal", "folder", "image", "cube", "globe", "notepad", "app" };
     bool ok = true;
     for (int a = 0; a < kTitleIconCount; ++a) {
         ok = load_line_icon(&apps[a][0], kApps[a], kTileIconSize, t.text) && ok;
@@ -173,7 +173,7 @@ bool TaskbarAssets::load() {
 bool WindowControlAssets::load() {
     const ui::Theme& t = ui::theme();
     static const char* const kGlyphs[4] = { "win-close", "win-maximize", "win-minimize", "win-restore" };
-    static const char* const kApps[kTitleIconCount] = { "terminal", "folder", "image", "cube", "globe", "app" };
+    static const char* const kApps[kTitleIconCount] = { "terminal", "folder", "image", "cube", "globe", "notepad", "app" };
     bool ok = true;
     for (int g = 0; g < 4; ++g) {
         ok = load_line_icon(&glyphs[g][0], kGlyphs[g], kControlGlyphSize, t.text) && ok;

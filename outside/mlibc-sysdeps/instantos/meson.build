@@ -10,6 +10,13 @@ rtld_sources += files(
 )
 rtld_include_dirs += include_directories('include')
 
+# ld.so takes each library's address space from mmap (0x6000_0000_0000 up)
+# instead of mlibc's fixed 0x41000000 upward. The kernel reaches its frames
+# through the identity map in every address space, so a library mapped at a
+# low address hides the kernel's own memory there (its page tables, heap and
+# stacks) once RAM in use passes 1 GiB: exec faulted zeroing a page table.
+internal_conf.set10('MLIBC_MMAP_ALLOCATE_DSO', true)
+
 libc_sources += files(
   'builtins.c',
   'entry.cpp',
@@ -77,6 +84,7 @@ if not no_headers
   # Windows and GPU-buffer surfaces for mlibc programs (Mesa's EGL platform).
   install_headers(
     'include/instantos/window.h',
+    'include/instantos/futex.h',
     subdir: 'instantos',
   )
 endif

@@ -116,6 +116,7 @@ add_subdirectory(file-browser)
 add_subdirectory(terminal)
 add_subdirectory(cube)
 add_subdirectory(ui-demo)
+add_subdirectory(notepad)
 # posix-smoke / net-smoke are conformance test apps (not runtime substrate and
 # not shipped in the os-testsuite ISO). posix-smoke uses a few declarations
 # (mkfifo/EWOULDBLOCK) that the clang header set exposes but GCC's does not, so
@@ -123,4 +124,5 @@ add_subdirectory(ui-demo)
 if(NOT INSTANTOS_USERLAND_GCC)
     add_subdirectory(posix-smoke)
     add_subdirectory(net-smoke)
+    add_subdirectory(native-threads)
 endif()

@@ -784,7 +784,17 @@ class FileBrowser : public ui::Window {
             return;
         }
         if (!entry.executable) {
-            set_message("Not a program", true);
+            // Other files open in Notepad (it refuses ones that are not text).
+            const char* const argv[] = { "/bin/notepad", target, nullptr };
+            if (std::spawn("/bin/notepad", argv) == fail) {
+                set_message("Could not start Notepad", true);
+                return;
+            }
+            char line[160] = {};
+            append_text(line, sizeof(line), "Opened ");
+            append_text(line, sizeof(line), entry.dir.name);
+            append_text(line, sizeof(line), " in Notepad");
+            set_message(line, false);
             return;
         }
         const std::uint64_t pid = std::spawn(target);

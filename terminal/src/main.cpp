@@ -411,6 +411,14 @@ const char* kShellCandidates[] = {
     nullptr,
 };
 
+// The shell's environment. Without a PATH in it bash makes its own but does not
+// export it, and programs that look themselves up in it fail: gcc could not
+// find its cc1 and cc1plus.
+const char* const kShellEnvironment[] = {
+    "PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin",
+    nullptr,
+};
+
 std::uint64_t spawn_shell(std::Handle slaveFd) {
     // Bind the slave to stdio slots so the spawned child inherits them. The
     // slave is a full 64-bit encoded handle; it must not be truncated to int.
@@ -420,7 +428,8 @@ std::uint64_t spawn_shell(std::Handle slaveFd) {
 
     std::uint64_t pid = fail;
     for (int i = 0; kShellCandidates[i] != nullptr; ++i) {
-        pid = std::spawn(kShellCandidates[i]);
+        const char* const argv[] = { kShellCandidates[i], nullptr };
+        pid = std::spawn(kShellCandidates[i], argv, kShellEnvironment);
         if (pid != fail) {
             break;
         }

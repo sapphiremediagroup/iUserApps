@@ -144,22 +144,99 @@ asm(
 extern "C" void __instantos_sigrestorer();
 
 namespace {
-constexpr int kMaxFd = 256;
+// The fd numbers of this process -> kernel handles. Chunks of one page, made
+// as they are needed (the first is static) and never moved, so a lookup takes
+// no lock; up to RLIMIT_NOFILE's ceiling (HandleTable::MaxNofile). 0 is a free
+// slot, except fds 0-2, whose handles are 0, 1 and 2 (the stdio convention).
+//
 // constinit forces compile-time initialization so no static constructor is
 // emitted. The rtld links this translation unit and panics if it finds any
 // own global constructor (init_array entry), so every file-scope object here
 // must be constant-initialized.
-constinit long fdTable[kMaxFd] = {0, 1, 2};
+constexpr int kFdChunk = 512;
+constexpr int kFdCeiling = 65536;
+constexpr int kFdChunks = kFdCeiling / kFdChunk;
+constinit long fdChunk0[kFdChunk] = {0, 1, 2};
+constinit long* fdChunks[kFdChunks] = {fdChunk0};
+// No free fd from 3 up lies below it (a hint: threads race on it, the slots
+// themselves are taken by compare-and-swap).
+constinit int fdLowestFree = 3;
+// RLIMIT_NOFILE's soft limit, asked of the kernel once (0: not yet).
+constinit long fdSoftLimit = 0;
 
 int sc_error(long ret) {
     return static_cast<unsigned long>(ret) > static_cast<unsigned long>(-4096) ? -ret : 0;
 }
 
+long* fd_slot(int fd, bool make) {
+    if (fd < 0 || fd >= kFdCeiling) {
+        return nullptr;
+    }
+    long*& link = fdChunks[fd / kFdChunk];
+    long* chunk = __atomic_load_n(&link, __ATOMIC_ACQUIRE);
+    if (!chunk) {
+        if (!make) return nullptr;
+        // A private anonymous page (zeroed), straight from the kernel.
+        long page = __do_syscall3(INSTANTOS_SYS_MMAP, 0, kFdChunk * sizeof(long), 3 /*read, write*/);
+        if (sc_error(page)) return nullptr;
+        long* expected = nullptr;
+        if (__atomic_compare_exchange_n(&link, &expected, reinterpret_cast<long*>(page), false,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            chunk = reinterpret_cast<long*>(page);
+        } else {
+            __do_syscall2(INSTANTOS_SYS_MUNMAP, page, kFdChunk * sizeof(long));   // another thread made it
+            chunk = expected;
+        }
+    }
+    return &chunk[fd % kFdChunk];
+}
+
+long fd_limit() {
+    long limit = __atomic_load_n(&fdSoftLimit, __ATOMIC_RELAXED);
+    if (limit > 0) return limit;
+    struct { unsigned long cur, max; } r = {0, 0};
+    limit = __do_syscall2(INSTANTOS_SYS_GETRLIMIT, 7 /*RLIMIT_NOFILE*/, reinterpret_cast<long>(&r)) == 0
+        ? static_cast<long>(r.cur > static_cast<unsigned long>(kFdCeiling) ? kFdCeiling : r.cur)
+        : 1024;
+    if (limit < 3) limit = 3;
+    __atomic_store_n(&fdSoftLimit, limit, __ATOMIC_RELAXED);
+    return limit;
+}
+
+// One past the highest fd in use (at least 3).
+int fd_top() {
+    for (int c = kFdChunks - 1; c >= 0; --c) {
+        long* chunk = __atomic_load_n(&fdChunks[c], __ATOMIC_ACQUIRE);
+        if (!chunk) continue;
+        for (int i = kFdChunk - 1; i >= 0; --i) {
+            if (__atomic_load_n(&chunk[i], __ATOMIC_RELAXED) != 0) {
+                const int top = c * kFdChunk + i + 1;
+                return top < 3 ? 3 : top;
+            }
+        }
+    }
+    return 3;
+}
+
 long handle_for_fd(int fd) {
-    if (fd < 0 || fd >= kMaxFd) {
+    long* slot = fd_slot(fd, false);
+    if (!slot) {
         return -1;
     }
-    return fdTable[fd];
+    const long handle = __atomic_load_n(slot, __ATOMIC_ACQUIRE);
+    return handle == 0 && fd > 2 ? -1 : handle;   // 0: a free slot
+}
+
+// Gives fd back (its slot is already 0, or is made 0 here).
+void free_fd(int fd) {
+    if (fd < 3) return;
+    if (long* slot = fd_slot(fd, false)) {
+        __atomic_store_n(slot, 0L, __ATOMIC_RELEASE);
+    }
+    int low = __atomic_load_n(&fdLowestFree, __ATOMIC_RELAXED);
+    while (fd < low && !__atomic_compare_exchange_n(&fdLowestFree, &low, fd, true,
+                                                     __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+    }
 }
 
 unsigned long parse_decimal(const char* value) {
@@ -173,15 +250,38 @@ unsigned long parse_decimal(const char* value) {
 // <instantos/window.h>: the kernel handle behind an fd, for the InstantOS
 // calls that take handles (a dma-buf for SurfaceFromBuffer).
 extern "C" [[gnu::visibility("default")]] long instantos_fd_handle(int fd) {
-    if (fd < 0 || fd >= kMaxFd || (fdTable[fd] == 0 && fd > 2)) return -1;
-    return fdTable[fd];
+    return handle_for_fd(fd);
 }
 
+// <instantos/futex.h>
+extern "C" [[gnu::visibility("default")]] int instantos_futex_wait(const volatile uint32_t* address, uint32_t expected,
+                                                                  const struct timespec* timeout) {
+    return mlibc::sysdep<FutexWait>(const_cast<int*>(reinterpret_cast<const volatile int*>(address)),
+                                    static_cast<int>(expected), timeout);
+}
+extern "C" [[gnu::visibility("default")]] int instantos_futex_wake(const volatile uint32_t* address, int count) {
+    const long n = __do_syscall2(INSTANTOS_SYS_FUTEX_WAKE,
+                                 reinterpret_cast<long>(const_cast<const uint32_t*>(address)),
+                                 count < 0 ? 0L : static_cast<long>(count));
+    return n < 0 ? 0 : static_cast<int>(n);
+}
+
+// The lowest free fd from `min` below RLIMIT_NOFILE, or -1 (EMFILE).
 int register_fd_min(long handle, int min) {
     if (min < 0) min = 0;
-    for (int fd = min; fd < kMaxFd; ++fd) {
-        if (fdTable[fd] == 0) {
-            fdTable[fd] = handle;
+    const int hint = __atomic_load_n(&fdLowestFree, __ATOMIC_RELAXED);
+    const bool fromHint = min <= hint;   // fds 0-2 are never free slots
+    const int limit = static_cast<int>(fd_limit());
+    for (int fd = fromHint ? hint : min; fd < limit; ++fd) {
+        long* slot = fd_slot(fd, true);
+        if (!slot) return -1;
+        // Slots are taken atomically: threads open files at the same time.
+        long unused = 0;
+        if (__atomic_compare_exchange_n(slot, &unused, handle, false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+            if (fromHint) {
+                int seen = hint;
+                __atomic_compare_exchange_n(&fdLowestFree, &seen, fd + 1, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
+            }
             return fd;
         }
     }
@@ -200,10 +300,11 @@ extern "C" [[gnu::visibility("default")]] int instantos_handle_fd(long handle) {
 }
 
 int register_fd_at(int fd, long handle) {
-    if (fd < 0 || fd >= kMaxFd) {
+    long* slot = fd_slot(fd, true);
+    if (!slot) {
         return -1;
     }
-    fdTable[fd] = handle;
+    __atomic_store_n(slot, handle, __ATOMIC_RELEASE);
     return fd;
 }
 
@@ -264,7 +365,12 @@ enum {
 };
 
 constexpr int kMaxDirs = 32;
-constexpr int kMaxDirEntries = 256;
+// The kernel's readdir has no offset, so a snapshot must hold the whole
+// directory. It starts at 256 entries and grows until the kernel returns fewer
+// than asked for: a fixed 256 cut binutils' bfd/ (~450 entries) short, and
+// make's VPATH cache then could not see elfxx-target.h (P7.1).
+constexpr int kFirstDirEntries = 256;
+constexpr int kMaxDirEntries = 65536;
 // Directory handles are returned to mlibc as fds (opendir stores them in
 // DIR::__handle, closedir calls close() on them). Offset them well above the
 // real fd range so Close() can recognise and free them without touching the
@@ -279,8 +385,16 @@ struct DirStream {
     int cursor = 0;
     int count = 0;
     char path[256];
-    instantos_dirent entries[kMaxDirEntries];
+    instantos_dirent* entries = nullptr;   // getAllocator(), freed by free_dir_entries
 };
+
+void free_dir_entries(DirStream& dir) {
+    if (dir.entries) {
+        getAllocator().free(dir.entries);
+        dir.entries = nullptr;
+    }
+    dir.count = 0;
+}
 
 // constinit + value-initialization keeps this in .bss with no static
 // constructor; see the note on fdTable above.
@@ -288,8 +402,7 @@ constinit DirStream dirStreams[kMaxDirs] = {};
 
 int alloc_dir_stream(const char* path) {
     for (int i = 0; i < kMaxDirs; ++i) {
-        if (!dirStreams[i].inUse) {
-            dirStreams[i].inUse = true;
+        if (!__atomic_exchange_n(&dirStreams[i].inUse, true, __ATOMIC_ACQ_REL)) {
             dirStreams[i].loaded = false;
             dirStreams[i].fromFd = false;
             dirStreams[i].ownerFd = 0;
@@ -350,7 +463,21 @@ unsigned char dt_from_filetype(unsigned int type) {
 // never stashed (initial process / fork child that didn't exec), leaving the
 // default {0,1,2} table intact.
 extern "C" void __instantos_restore_fdtable(void) {
-    __do_syscall2(INSTANTOS_SYS_FDTABLE_FETCH, reinterpret_cast<long>(fdTable), kMaxFd);
+    const long count = __do_syscall2(INSTANTOS_SYS_FDTABLE_FETCH, 0, 0);   // how many
+    if (count <= 0) return;
+    if (count <= kFdChunk) {
+        __do_syscall2(INSTANTOS_SYS_FDTABLE_FETCH, reinterpret_cast<long>(fdChunk0), count);
+        return;
+    }
+    const long bytes = count * static_cast<long>(sizeof(long));
+    long buffer = __do_syscall3(INSTANTOS_SYS_MMAP, 0, bytes, 3);
+    if (sc_error(buffer)) return;
+    const long got = __do_syscall2(INSTANTOS_SYS_FDTABLE_FETCH, buffer, count);
+    const long* table = reinterpret_cast<const long*>(buffer);
+    for (long fd = 0; fd < got && fd < kFdCeiling; ++fd) {
+        if (table[fd] != 0 || fd < 3) register_fd_at(static_cast<int>(fd), table[fd]);
+    }
+    __do_syscall2(INSTANTOS_SYS_MUNMAP, buffer, bytes);
 }
 
 namespace mlibc {
@@ -417,17 +544,19 @@ int Sysdeps<Close>::operator()(int fd) {
     if (fd >= kDirHandleBase) {
         int slot = fd - kDirHandleBase;
         if (slot < 0 || slot >= kMaxDirs || !dirStreams[slot].inUse) return EBADF;
-        dirStreams[slot].inUse = false;
+        free_dir_entries(dirStreams[slot]);
         dirStreams[slot].loaded = false;
+        __atomic_store_n(&dirStreams[slot].inUse, false, __ATOMIC_RELEASE);
         return 0;
     }
     // A real fd may also own an fdopendir() directory snapshot (see ReadEntries);
     // release it here so closedir(fdopendir(fd)) does not leak a DirStream slot.
     int dslot = find_dir_stream_by_fd(fd);
     if (dslot >= 0) {
-        dirStreams[dslot].inUse = false;
+        free_dir_entries(dirStreams[dslot]);
         dirStreams[dslot].loaded = false;
         dirStreams[dslot].fromFd = false;
+        __atomic_store_n(&dirStreams[dslot].inUse, false, __ATOMIC_RELEASE);
     }
     long handle = handle_for_fd(fd);
     if (handle < 0) return EBADF;
@@ -436,10 +565,12 @@ int Sysdeps<Close>::operator()(int fd) {
     // that libc stdio teardown (e.g. coreutils' close_stdout / fclose(stdout))
     // does not report a spurious "error closing file".
     if (fd < 3) return 0;
-    long ret = __do_syscall1(INSTANTOS_SYS_CLOSE, handle);
-    if (int e = sc_error(ret); e) return e;
-    fdTable[fd] = 0;
-    return sc_error(ret);
+    // Only one of two threads closing it gets the handle.
+    long* slot = fd_slot(fd, false);
+    handle = slot ? __atomic_exchange_n(slot, 0L, __ATOMIC_ACQ_REL) : 0;
+    if (handle == 0) return EBADF;
+    free_fd(fd);
+    return sc_error(__do_syscall1(INSTANTOS_SYS_CLOSE, handle));
 }
 
 int Sysdeps<Seek>::operator()(int fd, off_t offset, int whence, off_t* new_offset) {
@@ -465,6 +596,14 @@ int Sysdeps<Chdir>::operator()(const char* path) {
 
 int Sysdeps<OpenDir>::operator()(const char* path, int* handle) {
     if (!path || !handle) return EINVAL;
+    // POSIX: ENOENT for a missing path, ENOTDIR for anything but a directory.
+    // The stream reads its entries lazily, so without this opendir() on a file
+    // succeeded; e2fsprogs' profile code (mke2fs reading its mke2fs.conf) asks
+    // opendir whether a config path is a directory and wants ENOTDIR.
+    instantos_stat ks;
+    long st = __do_syscall2(INSTANTOS_SYS_STAT, reinterpret_cast<long>(path), reinterpret_cast<long>(&ks));
+    if (int e = sc_error(st); e) return e;
+    if ((ks.k_mode & 0170000) != 0040000) return ENOTDIR;
     int slot = alloc_dir_stream(path);
     if (slot < 0) return EMFILE;
     *handle = slot + kDirHandleBase;
@@ -501,11 +640,20 @@ int Sysdeps<ReadEntries>::operator()(int handle, void* buffer, size_t max_size, 
 
     // Snapshot the whole directory on first read.
     if (!dir.loaded) {
-        long ret = __do_syscall3(INSTANTOS_SYS_READDIR,
-                                 reinterpret_cast<long>(dir.path),
-                                 reinterpret_cast<long>(dir.entries),
-                                 kMaxDirEntries);
-        if (int e = sc_error(ret); e) return e;
+        free_dir_entries(dir);
+        long ret = 0;
+        for (int cap = kFirstDirEntries;; cap *= 4) {
+            dir.entries = static_cast<instantos_dirent*>(
+                getAllocator().allocate(sizeof(instantos_dirent) * cap));
+            if (!dir.entries) return ENOMEM;
+            ret = __do_syscall3(INSTANTOS_SYS_READDIR,
+                                reinterpret_cast<long>(dir.path),
+                                reinterpret_cast<long>(dir.entries),
+                                cap);
+            if (int e = sc_error(ret); e) { free_dir_entries(dir); return e; }
+            if (ret < cap || cap >= kMaxDirEntries) break;
+            free_dir_entries(dir);   // full: the directory may hold more
+        }
         dir.count = static_cast<int>(ret);
         dir.cursor = 0;
         dir.loaded = true;
@@ -626,6 +774,30 @@ struct instantos_pollfd {
     short revents;
 };
 
+namespace {
+// Memory for one call: `small` on the stack, or a mapping when more is needed.
+struct Scratch {
+    void* data = nullptr;
+    long mapped = 0;
+    Scratch(void* small, long smallBytes, long need) {
+        if (need <= smallBytes) {
+            data = small;
+            return;
+        }
+        const long r = __do_syscall3(INSTANTOS_SYS_MMAP, 0, need, 3);
+        if (!sc_error(r)) {
+            data = reinterpret_cast<void*>(r);
+            mapped = need;
+        }
+    }
+    ~Scratch() {
+        if (mapped) __do_syscall2(INSTANTOS_SYS_MUNMAP, reinterpret_cast<long>(data), mapped);
+    }
+    Scratch(const Scratch&) = delete;
+    Scratch& operator=(const Scratch&) = delete;
+};
+}
+
 int Sysdeps<Pselect>::operator()(int num_fds, fd_set* read_set, fd_set* write_set,
                                  fd_set* except_set, const struct timespec* timeout,
                                  const sigset_t* /*sigmask*/, int* num_events) {
@@ -645,11 +817,19 @@ int Sysdeps<Pselect>::operator()(int num_fds, fd_set* read_set, fd_set* write_se
         if (s) s->fds_bits[fd >> 3] |= (1u << (fd & 7));
     };
 
-    instantos_pollfd pfds[64];
-    int mapFd[64];
+    // Every fd an fd_set can hold (FD_SETSIZE).
+    if (num_fds < 0) return EINVAL;
+    if (num_fds > FD_SETSIZE) num_fds = FD_SETSIZE;
+    // The kernel's pollfds one after the other, then which fd each one is.
+    alignas(8) char small[64 * (sizeof(instantos_pollfd) + sizeof(int))];
+    Scratch scratch(small, sizeof(small),
+                    static_cast<long>(num_fds) * static_cast<long>(sizeof(instantos_pollfd) + sizeof(int)));
+    if (!scratch.data) return ENOMEM;
+    instantos_pollfd* pfds = static_cast<instantos_pollfd*>(scratch.data);
+    int* mapFd = reinterpret_cast<int*>(pfds + num_fds);
     int n = 0;
 
-    for (int fd = 0; fd < num_fds && n < 64; ++fd) {
+    for (int fd = 0; fd < num_fds; ++fd) {
         short ev = 0;
         if (fdIsSet(read_set, fd)) ev |= kPollIn;
         if (fdIsSet(write_set, fd)) ev |= kPollOut;
@@ -674,6 +854,9 @@ int Sysdeps<Pselect>::operator()(int num_fds, fd_set* read_set, fd_set* write_se
         ready = __do_syscall3(INSTANTOS_SYS_POLL, reinterpret_cast<long>(pfds),
                               static_cast<long>(n), timeoutMs);
         if (int e = sc_error(ready); e) return e;
+    } else if (timeoutMs > 0) {
+        // select(0, ..., &tv) is a way to sleep.
+        if (int e = sc_error(__do_syscall1(INSTANTOS_SYS_SLEEP, timeoutMs)); e) return e;
     }
 
     int total = 0;
@@ -701,11 +884,14 @@ int Sysdeps<Poll>::operator()(struct pollfd* fds, nfds_t count, int timeout, int
         if (num_events) *num_events = 0;
         return 0;
     }
-    if (count > 64) {
+    if (count > static_cast<nfds_t>(kFdCeiling)) {
         return EINVAL;
     }
 
-    instantos_pollfd kfds[64];
+    instantos_pollfd small[64];
+    Scratch scratch(small, sizeof(small), static_cast<long>(count) * static_cast<long>(sizeof(instantos_pollfd)));
+    if (!scratch.data) return ENOMEM;
+    instantos_pollfd* kfds = static_cast<instantos_pollfd*>(scratch.data);
     for (nfds_t i = 0; i < count; ++i) {
         long handle = handle_for_fd(fds[i].fd);
         // Negative fds are skipped per POSIX; pass an invalid handle so the
@@ -794,6 +980,10 @@ int Sysdeps<Fcntl>::operator()(int fd, int request, va_list args, int* result) {
     // (SHELL_FD_BASE=10) during redirection save/restore. Honoring the minimum
     // (instead of always starting at fd 3) keeps bash's fd bookkeeping correct.
     if (request == F_DUPFD || request == F_DUPFD_CLOEXEC) {
+        if (arg < 0 || arg >= fd_limit()) {
+            __do_syscall1(INSTANTOS_SYS_CLOSE, ret);
+            return EINVAL;
+        }
         int newfd = register_fd_min(ret, static_cast<int>(arg));
         if (newfd < 0) {
             __do_syscall1(INSTANTOS_SYS_CLOSE, ret);
@@ -812,8 +1002,9 @@ int Sysdeps<Fcntl>::operator()(int fd, int request, va_list args, int* result) {
     __builtin_unreachable();
 }
 
+// The process's id, also in its threads (GetPID is the thread's).
 pid_t Sysdeps<GetPid>::operator()() {
-    return __do_syscall0(INSTANTOS_SYS_GETPID);
+    return __do_syscall0(INSTANTOS_SYS_GETTGID);
 }
 
 pid_t Sysdeps<GetPpid>::operator()() {
@@ -851,12 +1042,27 @@ int Sysdeps<AnonFree>::operator()(void* pointer, size_t size) {
     return sysdep<VmUnmap>(pointer, size);
 }
 
+namespace {
+// To the kernel protection 0 is read and write (native programs' default), and
+// PROT_NONE is this.
+long kernel_prot(int prot) {
+    return prot == PROT_NONE ? 0x100 : prot;
+}
+}
+
 int Sysdeps<VmMap>::operator()(void* hint, size_t size, int prot, int flags, int fd, off_t offset, void** window) {
-    // Anonymous mappings (including AnonAllocate) use the plain demand-paged
-    // mmap that ignores fd/offset.
-    if ((flags & MAP_ANONYMOUS) || fd < 0) {
+    // The kernel takes an address as fixed and replaces what is there: without
+    // MAP_FIXED a hint must not.
+    if (!(flags & MAP_FIXED)) {
+        hint = nullptr;
+    }
+    // Private anonymous mappings (including AnonAllocate) use the plain
+    // demand-paged mmap that ignores fd/offset; shared ones are an object the
+    // kernel makes.
+    const bool anonymous = (flags & MAP_ANONYMOUS) || fd < 0;
+    if (anonymous && !(flags & MAP_SHARED)) {
         long ret = __do_syscall3(INSTANTOS_SYS_MMAP, reinterpret_cast<long>(hint),
-                                 static_cast<long>(size), prot);
+                                 static_cast<long>(size), kernel_prot(prot));
         if (int e = sc_error(ret); e) return e;
         *window = reinterpret_cast<void*>(ret);
         return 0;
@@ -865,13 +1071,13 @@ int Sysdeps<VmMap>::operator()(void* hint, size_t size, int prot, int flags, int
     // File-backed mapping: translate the userspace fd to its kernel handle and
     // hand the kernel the full argument set via a struct (six values exceed the
     // 5-argument syscall convention).
-    long handle = handle_for_fd(fd);
-    if (handle < 0) return EBADF;
+    long handle = anonymous ? -1 : handle_for_fd(fd);
+    if (handle < 0 && !anonymous) return EBADF;
     struct instantos_mmap_file_args args;
     args.addr = reinterpret_cast<unsigned long>(hint);
     args.length = static_cast<unsigned long>(size);
-    args.prot = static_cast<unsigned long>(prot);
-    args.flags = static_cast<unsigned long>(flags);
+    args.prot = static_cast<unsigned long>(kernel_prot(prot));
+    args.flags = static_cast<unsigned long>(anonymous ? flags | MAP_ANONYMOUS : flags);
     args.fd = static_cast<unsigned long>(handle);
     args.offset = static_cast<unsigned long>(offset);
     long ret = __do_syscall1(INSTANTOS_SYS_MMAP_FILE, reinterpret_cast<long>(&args));
@@ -887,8 +1093,20 @@ int Sysdeps<VmUnmap>::operator()(void* pointer, size_t size) {
 
 int Sysdeps<VmProtect>::operator()(void* pointer, size_t size, int prot) {
     long ret = __do_syscall3(INSTANTOS_SYS_MPROTECT, reinterpret_cast<long>(pointer),
-                             static_cast<long>(size), prot);
+                             static_cast<long>(size), kernel_prot(prot));
     return sc_error(ret);
+}
+
+int Sysdeps<MemfdCreate>::operator()(const char* name, int flags, int* fd) {
+    long ret = __do_syscall2(INSTANTOS_SYS_MEMFD_CREATE, reinterpret_cast<long>(name), flags);
+    if (int e = sc_error(ret); e) return e;
+    const int made = register_fd(ret);
+    if (made < 0) {
+        __do_syscall1(INSTANTOS_SYS_CLOSE, ret);
+        return EMFILE;
+    }
+    *fd = made;
+    return 0;
 }
 
 int Sysdeps<Msync>::operator()(void* pointer, size_t size, int flags) {
@@ -905,7 +1123,7 @@ int Sysdeps<Sysconf>::operator()(int number, long* result) {
 
     switch (number) {
         case _SC_OPEN_MAX:
-            *result = kMaxFd;
+            *result = fd_limit();
             return 0;
         case _SC_CHILD_MAX:
             *result = 1024;
@@ -1004,7 +1222,8 @@ void Sysdeps<Yield>::operator()() {
 }
 
 int Sysdeps<Sleep>::operator()(time_t* secs, long* nanos) {
-    long ms = (*secs * 1000) + (*nanos / 1000000);
+    // At least as long as asked: the kernel sleeps whole milliseconds.
+    long ms = (*secs * 1000) + (*nanos + 999999) / 1000000;
     long ret = __do_syscall1(INSTANTOS_SYS_SLEEP, ms);
     if (int e = sc_error(ret); e) return e;
     *secs = 0;
@@ -1012,13 +1231,34 @@ int Sysdeps<Sleep>::operator()(time_t* secs, long* nanos) {
     return 0;
 }
 
-int Sysdeps<FutexWait>::operator()(int*, int, const timespec*) {
-    sysdep<Yield>();
-    return 0;
+int Sysdeps<FutexWait>::operator()(int* pointer, int expected, const timespec* time) {
+    // The kernel takes nanoseconds, ~0 for no timeout.
+    unsigned long timeout = ~0UL;
+    if (time) {
+        if (time->tv_sec < 0 || time->tv_nsec < 0 || time->tv_nsec >= 1000000000) return EINVAL;
+        const unsigned long secs = static_cast<unsigned long>(time->tv_sec);
+        if (secs < 9000000000UL) {   // 285 years
+            timeout = secs * 1000000000UL + static_cast<unsigned long>(time->tv_nsec);
+        }
+    }
+    return sc_error(__do_syscall3(INSTANTOS_SYS_FUTEX_WAIT, reinterpret_cast<long>(pointer),
+                                  static_cast<long>(static_cast<unsigned int>(expected)),
+                                  static_cast<long>(timeout)));
 }
 
-int Sysdeps<FutexWake>::operator()(int*, bool) {
-    return 0;
+int Sysdeps<FutexWake>::operator()(int* pointer, bool all) {
+    return sc_error(__do_syscall2(INSTANTOS_SYS_FUTEX_WAKE, reinterpret_cast<long>(pointer), all ? -1L : 1L));
+}
+
+// The calling thread's id (the kernel's GetPID is per thread). The main
+// thread's is the process's.
+pid_t Sysdeps<FutexTid>::operator()() {
+    return static_cast<pid_t>(__do_syscall0(INSTANTOS_SYS_GETPID));
+}
+
+// gettid(): the same number (what Tgkill takes).
+pid_t Sysdeps<GetTid>::operator()() {
+    return static_cast<pid_t>(__do_syscall0(INSTANTOS_SYS_GETPID));
 }
 
 // pthread_setname_np / pthread_getname_np: the kernel keeps no thread names,
@@ -1054,9 +1294,10 @@ int Sysdeps<SetSchedparam>::operator()(void*, int, const struct sched_param*) {
 //
 // mlibc's generic pthread layer drives thread creation through three sysdeps:
 // PrepareStack lays out a fresh stack, Clone spawns the kernel thread on it,
-// and ThreadExit terminates the calling thread. Joining is done entirely in
-// userspace by mlibc (a futex spin on the TCB's didExit flag), so the kernel
-// side is deliberately handle-free. See sys_thread_clone() in the kernel.
+// and ThreadExit terminates the calling thread. Joining is done in userspace by
+// mlibc (a futex wait for the TCB's tid, which the kernel clears when the
+// thread is gone), so the kernel side is handle-free. See sys_thread_clone()
+// and sys_thread_exit_notify() in the kernel.
 //
 // This block is excluded from the runtime linker (ld-instantos.so), which is
 // single-threaded and does not link the pthread machinery (mlibc::thread_exit
@@ -1072,19 +1313,27 @@ static constexpr size_t kDefaultThreadStack = 0x200000;
 
 int Sysdeps<PrepareStack>::operator()(void** stack, void* entry, void* user_arg, void* tcb,
                                       size_t* stack_size, size_t* guard_size, void** stack_base) {
-    // We do not install a guard page yet; mlibc tolerates guard_size == 0.
-    *guard_size = 0;
     if (!*stack_size)
         *stack_size = kDefaultThreadStack;
 
     if (*stack) {
-        // Caller-provided stack (pthread_attr_setstack): use it as-is.
+        // Caller-provided stack (pthread_attr_setstack, or a kept one): as it is.
+        *guard_size = 0;
         *stack_base = *stack;
     } else {
+        // The guard, which no access survives, lies below the stack.
+        *stack_size = (*stack_size + 4095) & ~size_t{4095};
+        *guard_size = (*guard_size + 4095) & ~size_t{4095};
         void* base = nullptr;
-        if (int e = sysdep<AnonAllocate>(*stack_size, &base); e)
+        if (int e = sysdep<AnonAllocate>(*stack_size + *guard_size, &base); e)
             return e;
-        *stack_base = base;
+        if (*guard_size) {
+            if (int e = sysdep<VmProtect>(base, *guard_size, PROT_NONE); e) {
+                sysdep<VmUnmap>(base, *stack_size + *guard_size);
+                return e;
+            }
+        }
+        *stack_base = reinterpret_cast<char*>(base) + *guard_size;
     }
 
     // Lay the mlibc thread-entry arguments at the top of the stack. The stub
@@ -1115,7 +1364,7 @@ int Sysdeps<Clone>::operator()(void* tcb, pid_t* pid_out, void* stack) {
 }
 
 void Sysdeps<ThreadExit>::operator()() {
-    __do_syscall1(INSTANTOS_SYS_THREAD_EXIT, 0);
+    __do_syscall1(INSTANTOS_SYS_THREAD_EXIT_NOTIFY, reinterpret_cast<long>(&get_current_tcb()->tid));
     __builtin_unreachable();
 }
 
@@ -1259,20 +1508,54 @@ int Sysdeps<Tcsetattr>::operator()(int fd, int optional_action, const struct ter
     return sysdep<Ioctl>(fd, request, const_cast<struct termios*>(attr), &result);
 }
 
+// The kernel's signal masks are one 64-bit word with signal N at bit N (1..63);
+// mlibc's sigset_t (Linux's) has signal N at bit N-1 of its first word.
+static unsigned long kernel_sigmask(const sigset_t* set) {
+    return set ? set->__sig[0] << 1 : 0;
+}
+
+static void mlibc_sigmask(sigset_t* set, unsigned long mask) {
+    for (auto& word : set->__sig) word = 0;
+    set->__sig[0] = mask >> 1;
+}
+
 int Sysdeps<Sigprocmask>::operator()(int how, const sigset_t* set, sigset_t* retrieve) {
-    // The kernel models the blocked set as a single 64-bit mask; mlibc's
-    // sigset_t is an array of unsigned long. Only the first word carries the
-    // signals the kernel supports.
-    unsigned long kset = set ? set->__sig[0] : 0;
+    unsigned long kset = kernel_sigmask(set);
     unsigned long kold = 0;
     long ret = __do_syscall3(INSTANTOS_SYS_SIGPROCMASK, how,
                              set ? reinterpret_cast<long>(&kset) : 0,
                              retrieve ? reinterpret_cast<long>(&kold) : 0);
     if (int e = sc_error(ret); e) return e;
-    if (retrieve) {
-        for (auto& word : retrieve->__sig) word = 0;
-        retrieve->__sig[0] = kold;
+    if (retrieve) mlibc_sigmask(retrieve, kold);
+    return 0;
+}
+
+int Sysdeps<Sigsuspend>::operator()(const sigset_t* set) {
+    unsigned long mask = kernel_sigmask(set);
+    return sc_error(__do_syscall1(INSTANTOS_SYS_SIGSUSPEND, reinterpret_cast<long>(&mask)));
+}
+
+int Sysdeps<Sigpending>::operator()(sigset_t* set) {
+    unsigned long mask = 0;
+    if (int e = sc_error(__do_syscall1(INSTANTOS_SYS_SIGPENDING, reinterpret_cast<long>(&mask))); e) return e;
+    mlibc_sigmask(set, mask);
+    return 0;
+}
+
+// The kernel writes Linux's siginfo_t itself.
+int Sysdeps<Sigtimedwait>::operator()(const sigset_t* __restrict set, siginfo_t* __restrict info,
+                                      const struct timespec* __restrict timeout, int* out_signal) {
+    unsigned long mask = kernel_sigmask(set);
+    long ns = -1;   // no timeout
+    if (timeout) {
+        if (timeout->tv_sec < 0 || timeout->tv_nsec < 0 || timeout->tv_nsec >= 1000000000) return EINVAL;
+        ns = timeout->tv_sec > 9000000000L ? 9000000000L * 1000000000L
+                                           : timeout->tv_sec * 1000000000L + timeout->tv_nsec;
     }
+    long ret = __do_syscall3(INSTANTOS_SYS_SIGTIMEDWAIT, reinterpret_cast<long>(&mask),
+                             reinterpret_cast<long>(info), ns);
+    if (int e = sc_error(ret); e) return e;
+    *out_signal = static_cast<int>(ret);
     return 0;
 }
 
@@ -1283,7 +1566,7 @@ int Sysdeps<Sigaction>::operator()(int signum, const struct sigaction* __restric
 
     if (act) {
         kact.handler = reinterpret_cast<unsigned long>(act->sa_handler);
-        kact.mask = act->sa_mask.__sig[0];
+        kact.mask = kernel_sigmask(&act->sa_mask);
         kact.flags = act->sa_flags;
         // mlibc leaves sa_restorer unset; always install our sigreturn trampoline
         // so a returning handler restores context instead of jumping to garbage.
@@ -1296,9 +1579,8 @@ int Sysdeps<Sigaction>::operator()(int signum, const struct sigaction* __restric
     if (int e = sc_error(ret); e) return e;
 
     if (oldact) {
-        for (auto& word : oldact->sa_mask.__sig) word = 0;
         oldact->sa_handler = reinterpret_cast<void (*)(int)>(kold.handler);
-        oldact->sa_mask.__sig[0] = kold.mask;
+        mlibc_sigmask(&oldact->sa_mask, kold.mask);
         oldact->sa_flags = kold.flags;
         oldact->sa_restorer = reinterpret_cast<void (*)(void)>(kold.restorer);
     }
@@ -1322,11 +1604,13 @@ int Sysdeps<Dup>::operator()(int fd, int, int* newfd) {
 int Sysdeps<Dup2>::operator()(int fd, int, int newfd) {
     long handle = handle_for_fd(fd);
     if (handle < 0) return EBADF;
-    if (newfd < 0 || newfd >= kMaxFd) return EBADF;
+    if (newfd < 0 || newfd >= fd_limit()) return EBADF;
 
     // Determine the kernel target handle for newfd. For stdio slots the kernel
     // accepts the encoded File slot; otherwise allocate against the existing.
-    long targetHandle = fdTable[newfd];
+    long* targetSlot = fd_slot(newfd, true);
+    if (!targetSlot) return ENOMEM;
+    long targetHandle = __atomic_load_n(targetSlot, __ATOMIC_ACQUIRE);
     long ret;
     if (targetHandle != 0 || newfd < 3) {
         ret = __do_syscall2(INSTANTOS_SYS_DUP2, handle, targetHandle ? targetHandle : newfd);
@@ -1345,8 +1629,10 @@ int Sysdeps<Pipe>::operator()(int* fds, int) {
     int r = register_fd(handles[0]);
     int w = register_fd(handles[1]);
     if (r < 0 || w < 0) {
-        if (r >= 0) { __do_syscall1(INSTANTOS_SYS_CLOSE, handles[0]); fdTable[r] = 0; }
-        if (w >= 0) { __do_syscall1(INSTANTOS_SYS_CLOSE, handles[1]); fdTable[w] = 0; }
+        if (r >= 0) free_fd(r);
+        if (w >= 0) free_fd(w);
+        __do_syscall1(INSTANTOS_SYS_CLOSE, handles[0]);
+        __do_syscall1(INSTANTOS_SYS_CLOSE, handles[1]);
         return EMFILE;
     }
     fds[0] = r;
@@ -1393,10 +1679,27 @@ int Sysdeps<Execve>::operator()(const char* path, char* const argv[], char* cons
     // survive exec. The kernel keeps the handle table (dropping CLOEXEC); this
     // snapshot lets the new image's libc rebuild its userspace fd map at entry
     // (see __instantos_restore_fdtable / entry.cpp).
-    __do_syscall2(INSTANTOS_SYS_FDTABLE_STASH, reinterpret_cast<long>(fdTable), kMaxFd);
+    const int top = fd_top();
+    long buffer = 0;
+    long bytes = 0;
+    if (top <= kFdChunk) {
+        __do_syscall2(INSTANTOS_SYS_FDTABLE_STASH, reinterpret_cast<long>(fdChunk0), top);
+    } else {
+        // The chunks one after the other, in a buffer exec does away with.
+        bytes = static_cast<long>(top) * static_cast<long>(sizeof(long));
+        buffer = __do_syscall3(INSTANTOS_SYS_MMAP, 0, bytes, 3);
+        if (sc_error(buffer)) return ENOMEM;
+        long* table = reinterpret_cast<long*>(buffer);
+        for (int fd = 0; fd < top; ++fd) {
+            long* slot = fd_slot(fd, false);
+            table[fd] = slot ? __atomic_load_n(slot, __ATOMIC_RELAXED) : 0;
+        }
+        __do_syscall2(INSTANTOS_SYS_FDTABLE_STASH, buffer, top);
+    }
     long ret = __do_syscall3(INSTANTOS_SYS_EXEC, reinterpret_cast<long>(path),
                              reinterpret_cast<long>(argv), reinterpret_cast<long>(envp));
     // Only returns on failure.
+    if (buffer) __do_syscall2(INSTANTOS_SYS_MUNMAP, buffer, bytes);
     return sc_error(ret);
 }
 
@@ -1405,6 +1708,12 @@ int Sysdeps<Execve>::operator()(const char* path, char* const argv[], char* cons
 int Sysdeps<Kill>::operator()(pid_t pid, int sig) {
     long ret = __do_syscall2(INSTANTOS_SYS_KILL, pid, sig);
     return sc_error(ret);
+}
+
+// One thread, with si_code SI_TKILL (what pthread_cancel's handler checks).
+int Sysdeps<Tgkill>::operator()(int tgid, int tid, int sig) {
+    if (tid <= 0) return ESRCH;   // it has ended
+    return sc_error(__do_syscall3(INSTANTOS_SYS_TGKILL, tgid, tid, sig));
 }
 
 int Sysdeps<Chmod>::operator()(const char* pathname, mode_t mode) {
@@ -1461,10 +1770,20 @@ int Sysdeps<Renameat>::operator()(int olddirfd, const char* old_path,
 // Each resolves the path against its directory fd (at_resolve) and delegates to
 // the existing kernel syscall.
 
-int Sysdeps<Fchmodat>::operator()(int dirfd, const char* pathname, mode_t mode, int /*flags*/) {
+int Sysdeps<Fchmodat>::operator()(int dirfd, const char* pathname, mode_t mode, int flags) {
     char buf[512]; int e;
     const char* p = at_resolve(dirfd, pathname, buf, sizeof(buf), &e);
     if (!p) return e;
+    // As Linux: AT_SYMLINK_NOFOLLOW on a symlink is EOPNOTSUPP (links have no
+    // mode of their own), anything else is changed as usual. GNU tar, as root,
+    // sets every extracted symlink's mode this way and ignores only that error;
+    // following the link instead failed on links whose target was not
+    // extracted yet (mlibc's abi-bits headers), and tar exited 2 (P7.3).
+    if (flags & AT_SYMLINK_NOFOLLOW) {
+        struct stat st;
+        if (int se = sysdep<Stat>(fsfd_target::path, AT_FDCWD, p, AT_SYMLINK_NOFOLLOW, &st); se) return se;
+        if (S_ISLNK(st.st_mode)) return EOPNOTSUPP;
+    }
     long ret = __do_syscall3(INSTANTOS_SYS_CHMOD, reinterpret_cast<long>(p),
                              static_cast<long>(mode), 0);
     return sc_error(ret);
@@ -1621,37 +1940,41 @@ int Sysdeps<GetEntropy>::operator()(void* buffer, size_t length) {
 
 // --- Process limits / credentials / timing (cheap, mostly fixed values) ----
 
+// The kernel keeps RLIMIT_NOFILE (inherited, kept across exec; this table
+// stays under its soft limit); the other resources read as unlimited.
 int Sysdeps<GetRlimit>::operator()(int resource, struct rlimit* limit) {
     if (!limit) return EINVAL;
-    // The kernel enforces no per-process resource limits; report generous,
-    // effectively-unlimited values so tools (e.g. sort sizing its buffers) get
-    // sensible answers. RLIMIT_NOFILE matches the userspace fd table cap.
-    limit->rlim_cur = RLIM_INFINITY;
-    limit->rlim_max = RLIM_INFINITY;
-    if (resource == RLIMIT_NOFILE) {
-        limit->rlim_cur = 256;
-        limit->rlim_max = 256;
-    }
+    struct { unsigned long cur, max; } r = {0, 0};
+    if (int e = sc_error(__do_syscall2(INSTANTOS_SYS_GETRLIMIT, resource, reinterpret_cast<long>(&r))); e) return e;
+    limit->rlim_cur = r.cur == ~0UL ? RLIM_INFINITY : r.cur;
+    limit->rlim_max = r.max == ~0UL ? RLIM_INFINITY : r.max;
     return 0;
 }
 
-int Sysdeps<SetRlimit>::operator()(int /*resource*/, const struct rlimit* /*limit*/) {
-    // No enforced limits to change; accept silently.
+int Sysdeps<SetRlimit>::operator()(int resource, const struct rlimit* limit) {
+    if (!limit) return EINVAL;
+    struct { unsigned long cur, max; } r = {
+        limit->rlim_cur == RLIM_INFINITY ? ~0UL : static_cast<unsigned long>(limit->rlim_cur),
+        limit->rlim_max == RLIM_INFINITY ? ~0UL : static_cast<unsigned long>(limit->rlim_max)};
+    if (int e = sc_error(__do_syscall2(INSTANTOS_SYS_SETRLIMIT, resource, reinterpret_cast<long>(&r))); e) return e;
+    if (resource == RLIMIT_NOFILE) {
+        __atomic_store_n(&fdSoftLimit, 0L, __ATOMIC_RELAXED);   // ask again
+    }
     return 0;
 }
 
 int Sysdeps<Times>::operator()(struct tms* tms, clock_t* out) {
     // No per-process CPU accounting yet. Report zero CPU time and the
-    // monotonic millisecond clock as the "elapsed" tick return (times() returns
-    // a clock_t of elapsed real time).
+    // monotonic clock as the "elapsed" tick return (times() returns a clock_t
+    // of elapsed real time), in mlibc's sysconf(_SC_CLK_TCK) ticks: 1000000.
     if (tms) {
         tms->tms_utime = 0;
         tms->tms_stime = 0;
         tms->tms_cutime = 0;
         tms->tms_cstime = 0;
     }
-    long ms = __do_syscall0(INSTANTOS_SYS_GETTIME);
-    if (out) *out = static_cast<clock_t>(ms);
+    long ns = __do_syscall0(INSTANTOS_SYS_GETTIME_NS);
+    if (out) *out = static_cast<clock_t>(ns / 1000);
     return 0;
 }
 
@@ -1774,6 +2097,17 @@ int Sysdeps<Utimensat>::operator()(int dirfd, const char* pathname,
         const char* p = at_resolve(dirfd, pathname, buf, sizeof(buf), &rerr);
         if (!p) return rerr;
         target = reinterpret_cast<long>(p);
+        // The kernel's Utime follows links and a link has no times of its own
+        // here: AT_SYMLINK_NOFOLLOW on a symlink is EOPNOTSUPP, which GNU tar
+        // ignores for links. Following it instead set the target's times, or
+        // failed (ENOENT) on a link extracted before its target, and tar
+        // exited 2 unpacking the toolchain tarball.
+        if (flags & AT_SYMLINK_NOFOLLOW) {
+            instantos_stat ls;
+            long lret = __do_syscall2(INSTANTOS_SYS_LSTAT, target, reinterpret_cast<long>(&ls));
+            if (int e = sc_error(lret); e) return e;
+            if ((ls.k_mode & 0170000) == 0120000) return EOPNOTSUPP;
+        }
     }
 
     long now = __do_syscall0(INSTANTOS_SYS_GETUNIXTIME);
@@ -1846,6 +2180,12 @@ int Sysdeps<Fsync>::operator()(int fd) {
     long handle = handle_for_fd(fd);
     if (handle < 0) return EBADF;
     return sc_error(__do_syscall1(INSTANTOS_SYS_FSYNC, handle));
+}
+
+// sync(2): commit every ext4 volume's running transaction and flush it
+// (StorageSync, mode 0 = All). Without it mlibc's sync() did nothing.
+void Sysdeps<Sync>::operator()() {
+    __do_syscall1(INSTANTOS_SYS_STORAGE_SYNC, 0);
 }
 
 int Sysdeps<Fdatasync>::operator()(int fd) {
@@ -2029,8 +2369,9 @@ int unix_msg_send(long handle, const struct msghdr* hdr, int flags, ssize_t* len
             const int* fds = reinterpret_cast<const int*>(CMSG_DATA(c));
             for (size_t i = 0; i < n; ++i) {
                 if (count == kMaxPassedFds) return EINVAL;
-                if (fds[i] < 0 || fds[i] >= kMaxFd || (fdTable[fds[i]] == 0 && fds[i] > 2)) return EBADF;
-                handles[count++] = handle_for_fd(fds[i]);
+                const long handle = handle_for_fd(fds[i]);
+                if (handle < 0) return EBADF;
+                handles[count++] = handle;
             }
         }
     }
@@ -2377,7 +2718,7 @@ int Sysdeps<Socketpair>::operator()(int domain, int type_and_flags, int proto, i
     int a = register_fd(handles[0]);
     int b = a >= 0 ? register_fd(handles[1]) : -1;
     if (a < 0 || b < 0) {
-        if (a >= 0) fdTable[a] = 0;
+        if (a >= 0) free_fd(a);
         __do_syscall1(INSTANTOS_SYS_CLOSE, handles[0]);
         __do_syscall1(INSTANTOS_SYS_CLOSE, handles[1]);
         return EMFILE;
@@ -2495,7 +2836,7 @@ __mlibc_thread_trampoline(void* (*fn)(void*), Tcb* tcb, void* arg) {
     if (mlibc::sysdep<TcbSet>(tcb))
         __ensure(!"instantos: failed to set TCB for new thread");
 
-    // Wait until the parent publishes our TID (FutexWait yields to it).
+    // Wait until the parent publishes our TID.
     while (__atomic_load_n(&tcb->tid, __ATOMIC_RELAXED) == 0)
         mlibc::sysdep<FutexWait>(&tcb->tid, 0, nullptr);
 
@@ -2506,4 +2847,167 @@ __mlibc_thread_trampoline(void* (*fn)(void*), Tcb* tcb, void* arg) {
     mlibc::thread_exit(tcb->returnValue);
 }
 
+#endif  // !MLIBC_BUILDING_RTLD
+
+// --- What Rust's std (x86_64-unknown-linux-musl) calls beyond POSIX --------
+//
+// Rust programs (tools/rust-port) are built for musl and linked against mlibc,
+// whose headers follow the same Linux ABI. These are the musl/glibc functions
+// std uses that mlibc lacks or keeps behind its Linux option (off here, so that
+// configure scripts do not find epoll and the like).
+#ifndef MLIBC_BUILDING_RTLD
+#include <errno.h>
+#include <pthread.h>
+#include <spawn.h>
+#include <stdlib.h>
+
+namespace {
+// musl's posix_spawn file action (mlibc's spawn.cpp has the same; it runs
+// FDOP_CHDIR but has no function that adds one).
+struct instantos_fdop {
+    instantos_fdop *next, *prev;
+    int cmd, fd, srcfd, oflag;
+    mode_t mode;
+    char path[];
+};
+constexpr int kFdopChdir = 4;
+constexpr int kFdopFchdir = 5;
+
+int add_fdop(posix_spawn_file_actions_t* fa, instantos_fdop* op) {
+    op->prev = nullptr;
+    if ((op->next = static_cast<instantos_fdop*>(fa->__actions))) op->next->prev = op;
+    fa->__actions = op;
+    return 0;
+}
+
+long futex_result(int e) {
+    if (!e) return 0;
+    errno = e;
+    return -1;
+}
+
+// Linux's futex(2) as std uses it: WAIT (relative timeout) and WAIT_BITSET
+// (absolute), WAKE, with any bitset taken as all and PRIVATE ignored.
+long linux_futex(long uaddr, long op, long val, long timeoutPtr, long val3) {
+    constexpr long kWait = 0, kWake = 1, kWaitBitset = 9, kWakeBitset = 10;
+    constexpr long kClockRealtime = 256;
+    auto* word = reinterpret_cast<int*>(uaddr);
+    const long cmd = op & 127;
+    if (cmd == kWake || cmd == kWakeBitset) {
+        const long n = __do_syscall2(INSTANTOS_SYS_FUTEX_WAKE, uaddr, val < 0 ? 0x7fffffffL : val);
+        if (int e = sc_error(n); e) return futex_result(e);
+        return n;
+    }
+    if (cmd != kWait && cmd != kWaitBitset) return futex_result(ENOSYS);
+    (void)val3;
+    const auto* ts = reinterpret_cast<const struct timespec*>(timeoutPtr);
+    if (!ts) return futex_result(mlibc::sysdep<FutexWait>(word, static_cast<int>(val), nullptr));
+    struct timespec rel = *ts;
+    if (cmd == kWaitBitset) {   // absolute: what is left of it
+        struct timespec now;
+        clock_gettime((op & kClockRealtime) ? CLOCK_REALTIME : CLOCK_MONOTONIC, &now);
+        long long ns = (ts->tv_sec - now.tv_sec) * 1000000000LL + (ts->tv_nsec - now.tv_nsec);
+        if (ns <= 0) return futex_result(ETIMEDOUT);
+        rel.tv_sec = ns / 1000000000LL;
+        rel.tv_nsec = ns % 1000000000LL;
+    }
+    return futex_result(mlibc::sysdep<FutexWait>(word, static_cast<int>(val), &rel));
+}
+}
+
+// syscall(2) with Linux's numbers: the few std makes directly. The rest are
+// ENOSYS, from which std falls back (statx, clone3, pidfd_*, copy_file_range).
+extern "C" [[gnu::visibility("default")]] long syscall(long number, ...) {
+    va_list ap;
+    va_start(ap, number);
+    long a[6];
+    for (long& v : a) v = va_arg(ap, long);
+    va_end(ap);
+    switch (number) {
+    case 202:   // futex
+        return linux_futex(a[0], a[1], a[2], a[3], a[5]);
+    case 318: {   // getrandom(buf, len, flags)
+        auto* p = reinterpret_cast<unsigned char*>(a[0]);
+        const size_t len = static_cast<size_t>(a[1]);
+        for (size_t done = 0; done < len;) {
+            const size_t n = len - done > 256 ? 256 : len - done;
+            if (getentropy(p + done, n) != 0) return -1;
+            done += n;
+        }
+        return static_cast<long>(len);
+    }
+    case 186:   // gettid
+        return __do_syscall0(INSTANTOS_SYS_GETPID);
+    case 39:    // getpid
+        return getpid();
+    default:
+        errno = ENOSYS;
+        return -1;
+    }
+}
+
+extern "C" [[gnu::visibility("default")]] int posix_spawn_file_actions_addchdir_np(
+        posix_spawn_file_actions_t* __restrict fa, const char* __restrict path) {
+    auto* op = static_cast<instantos_fdop*>(malloc(sizeof(instantos_fdop) + strlen(path) + 1));
+    if (!op) return ENOMEM;
+    op->cmd = kFdopChdir;
+    op->fd = -1;
+    strcpy(op->path, path);
+    return add_fdop(fa, op);
+}
+
+extern "C" [[gnu::visibility("default")]] int posix_spawn_file_actions_addfchdir_np(
+        posix_spawn_file_actions_t* fa, int fd) {
+    auto* op = static_cast<instantos_fdop*>(malloc(sizeof(instantos_fdop)));
+    if (!op) return ENOMEM;
+    op->cmd = kFdopFchdir;
+    op->fd = fd;
+    return add_fdop(fa, op);
+}
+
+// glibc's name for the XSI strerror_r, which musl's libc crate binding uses.
+extern "C" [[gnu::visibility("default")]] int __xpg_strerror_r(int e, char* buffer, size_t size) {
+    const char* text = strerror(e);
+    const size_t n = strlen(text);
+    if (!buffer || size == 0) return ERANGE;
+    const size_t copy = n < size ? n : size - 1;
+    memcpy(buffer, text, copy);
+    buffer[copy] = 0;
+    return copy < n ? ERANGE : 0;
+}
+
+// The CPUs this process may run on (SchedGetAffinity: one 64-bit word).
+extern "C" [[gnu::visibility("default")]] int sched_getaffinity(pid_t pid, size_t size, cpu_set_t* set) {
+    if (!set || size < 8) {
+        errno = EINVAL;
+        return -1;
+    }
+    unsigned long mask = 0;
+    if (int e = sc_error(__do_syscall3(INSTANTOS_SYS_SCHED_GETAFFINITY, pid, 8, reinterpret_cast<long>(&mask))); e) {
+        errno = e;
+        return -1;
+    }
+    memset(set, 0, size);
+    memcpy(set, &mask, sizeof(mask));
+    return 0;
+}
+
+// A thread's stack: mlibc's own threads know theirs; the main thread's is the
+// kernel's (32 pages under 0x7FFFFFFFE000 and an 8 MiB demand-zero reserve).
+extern "C" [[gnu::visibility("default")]] int pthread_getattr_np(pthread_t thread, pthread_attr_t* attr) {
+    auto* tcb = reinterpret_cast<Tcb*>(thread);
+    *attr = pthread_attr_t{};
+    if (tcb->stackAddr && tcb->stackSize) {
+        attr->__mlibc_stackaddr = tcb->stackAddr;
+        attr->__mlibc_stacksize = tcb->stackSize;
+    } else {
+        constexpr unsigned long kTop = 0x00007FFFFFFFE000UL;
+        constexpr unsigned long kSize = 32 * 4096UL + 8 * 1024 * 1024UL;
+        attr->__mlibc_stackaddr = reinterpret_cast<void*>(kTop - kSize);
+        attr->__mlibc_stacksize = kSize;
+    }
+    attr->__mlibc_guardsize = tcb->guardSize;
+    attr->__mlibc_detachstate = tcb->isJoinable ? PTHREAD_CREATE_JOINABLE : PTHREAD_CREATE_DETACHED;
+    return 0;
+}
 #endif  // !MLIBC_BUILDING_RTLD
